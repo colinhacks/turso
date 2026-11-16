@@ -579,6 +579,14 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// type, read before the MVCC peek was taken.
     /// See [`Self::reseek_mvcc_if_rows_changed`].
     mvcc_peek_epoch: u64,
+    /// The direction in which `next()` or `prev()` can step using the two
+    /// peeks. `None` when the peeks are not the rows next to the current row,
+    /// as after `exists()` or an insert at another key. A step in any other
+    /// direction first seeks past the current row.
+    peeks_valid_for: Option<IterationDirection>,
+    /// The seek past the current row that a step started, so that a step that
+    /// returned IO resumes it.
+    seek_past_current: Option<SeekOp>,
     /// Set when an exact-match seek found no visible MVCC row for its key. The
     /// MVCC iterator then stands at the first row past the key, which the next
     /// step reads.
@@ -656,6 +664,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
+            peeks_valid_for: None,
+            seek_past_current: None,
             mvcc_peek_stopped_at_seek_key: false,
             btree_peek_stopped_at_seek_key: false,
         })
@@ -1365,6 +1375,41 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
     }
 
+    /// Whether a step in `dir` must first seek past the current row, because
+    /// the peeks are not the rows next to it in that direction.
+    fn step_needs_seek(&self, dir: IterationDirection) -> bool {
+        self.state.is_none()
+            && matches!(self.current_pos, CursorPosition::Loaded { .. })
+            && self.peeks_valid_for != Some(dir)
+    }
+
+    /// Moves to the first visible row past the current row in `op`'s
+    /// direction by seeking both sources again.
+    fn seek_past_current_row(&mut self, op: SeekOp) -> IOResultOr<()> {
+        let CursorPosition::Loaded { row_id, .. } = &self.current_pos else {
+            unreachable!("only a cursor on a row can seek past it");
+        };
+        let key = row_id.row_id.clone();
+        self.seek_past_current = Some(op);
+        let result = match &key {
+            RowKey::Int(rowid) => CursorTrait::seek(self, SeekKey::TableRowId(*rowid), op),
+            RowKey::Record(record) => {
+                CursorTrait::seek(self, SeekKey::IndexKey(record.key.clone()), op)
+            }
+        };
+        match result {
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(_)) => {
+                self.seek_past_current = None;
+                Ok(IOResult::Done(()))
+            }
+            Err(e) => {
+                self.seek_past_current = None;
+                Err(e)
+            }
+        }
+    }
+
     /// An exact-match seek stops each source at the end of its rows for the
     /// key. Before a step in the seek's direction moves past them, this reads
     /// each stopped source's next row from where the seek left it.
@@ -1519,6 +1564,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();
         self.state = None;
+        self.peeks_valid_for = Some(IterationDirection::Backwards);
 
         Ok(IOResult::Done(()))
     }
@@ -1527,6 +1573,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
+        if let Some(op) = self.seek_past_current {
+            return self.seek_past_current_row(op);
+        }
+        if self.step_needs_seek(IterationDirection::Forwards) {
+            return self.seek_past_current_row(SeekOp::GT);
+        }
         return_if_io!(self.read_past_seek_key(IterationDirection::Forwards));
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
@@ -1617,6 +1669,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.refresh_current_position(IterationDirection::Forwards);
         self.invalidate_record();
         self.state = None;
+        self.peeks_valid_for = Some(IterationDirection::Forwards);
 
         Ok(IOResult::Done(()))
     }
@@ -1625,6 +1678,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
+        if let Some(op) = self.seek_past_current {
+            return self.seek_past_current_row(op);
+        }
+        if self.step_needs_seek(IterationDirection::Backwards) {
+            return self.seek_past_current_row(SeekOp::LT);
+        }
         return_if_io!(self.read_past_seek_key(IterationDirection::Backwards));
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
@@ -1708,6 +1767,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();
         self.state = None;
+        self.peeks_valid_for = Some(IterationDirection::Backwards);
 
         Ok(IOResult::Done(()))
     }
@@ -1920,6 +1980,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                     // Now pick the winner based on direction
                     let winner_pos = self.position_from_peeks(direction);
                     self.state = None;
+                    self.peeks_valid_for = Some(direction);
                     if let CursorPosition::Loaded {
                         row_id,
                         in_btree,
@@ -1962,6 +2023,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             if found {
                                 return Ok(IOResult::Done(SeekResult::Found));
                             } else {
+                                // The cursor stands past the key, where the two
+                                // sources need not have stopped at the same row.
+                                self.peeks_valid_for = None;
                                 return Ok(IOResult::Done(SeekResult::NotFound));
                             }
                         } else {
@@ -2041,6 +2105,18 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             _ => false,
         };
 
+        // A step after an insert starts from the inserted row, so the peeks stay
+        // valid only for an insert at the current row. Only rowids are compared,
+        // which is cheap; a step after an index insert always seeks again.
+        let at_current_row = match (&self.current_pos, &row.id.row_id) {
+            (CursorPosition::Loaded { row_id, .. }, RowKey::Int(rowid)) => {
+                row_id.row_id == RowKey::Int(*rowid)
+            }
+            _ => false,
+        };
+        if !at_current_row {
+            self.peeks_valid_for = None;
+        }
         self.current_pos = CursorPosition::Loaded {
             row_id: row.id.clone(),
             in_btree: was_btree_resident,
@@ -2138,6 +2214,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
         if self.state.is_none() {
+            self.peeks_valid_for = None;
             let _ = self.table_iterator.take();
             let _ = self.index_iterator.take();
             self.reset_dual_peek();
@@ -2402,6 +2479,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
 
         self.invalidate_record();
         self.state = None;
+        self.peeks_valid_for = Some(IterationDirection::Forwards);
         Ok(IOResult::Done(()))
     }
 
@@ -2421,6 +2499,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
+        self.peeks_valid_for = None;
         if self.is_btree_allocated() {
             // Defer to btree cursor's seek_end implementation
             self.btree_cursor.seek_end()
