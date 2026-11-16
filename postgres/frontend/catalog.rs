@@ -187,10 +187,6 @@ impl Dialect for PostgresDialect {
         turso_core::dialect::engine::format_table_sql(tbl_name, body)
     }
 
-    fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        turso_core::dialect::engine::register_builtin_catalog(schema, enable_custom_types)
-    }
-
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
         let options = crate::functions::register_functions(options);
         let options = crate::auth_functions::register_functions(options);
