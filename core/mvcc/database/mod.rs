@@ -6398,44 +6398,71 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<Option<(RowID, RowVersions<A>)>> {
         let index_rows = self.get_or_create_index_rows(index_id)?;
         let index_rows = index_rows.value();
-        let range = if eq_only {
-            // An eq-only seek (point lookup, NoConflict, unique-constraint probe,
-            // index delete) only cares about entries whose key matches `start`.
-            // Bound BOTH ends of the range to the probe key so the skiplist walk
-            // stops at the matching cluster instead of scanning forward over every
-            // invisible neighbor until it happens to find the next visible row.
-            //
-            // `SortableIndexKey` ordering compares only the probe's columns (see
-            // `SortableIndexKey::compare`, which clamps to `min(num_cols)`), so
-            // `start..=start` captures all entries sharing the probed prefix
-            // regardless of their trailing rowid — exactly the set an eq-only seek
-            // may match. Without this bound a single seek costs O(pending invisible
-            // versions), which compounds into quadratic work when each row of a
-            // concurrent batch insert pays it. The cursor's position after the seek
-            // is still set by `PickWinner` from the merged MVCC/B-tree peeks, so
-            // returning early here does not change where the cursor lands.
-            (Bound::Included(start.clone()), Bound::Included(start))
+        // An eq-only seek (point lookup, NoConflict, unique-constraint probe,
+        // index delete) only reads the entries whose key matches `start`: it
+        // stops at the first entry past them instead of scanning forward over
+        // every invisible neighbor until it happens to find a visible row.
+        // Without that stop a single seek costs O(pending invisible versions),
+        // which compounds into quadratic work when each row of a concurrent batch
+        // insert pays it. The iterator is not bounded to `start`, so a step past
+        // the matching entries reads on from there.
+        //
+        // `SortableIndexKey` equality compares only the probe's columns (see
+        // `SortableIndexKey::compare`, which clamps to `min(num_cols)`), so the
+        // matching entries are all those sharing the probed prefix, whatever
+        // their trailing rowid.
+        let exact_key = eq_only.then(|| start.clone());
+        let start = if inclusive {
+            Bound::Included(start)
         } else {
-            let start = if inclusive {
-                Bound::Included(start)
-            } else {
-                Bound::Excluded(start)
-            };
-            create_seek_range(start, direction)
+            Bound::Excluded(start)
         };
-        let iter_box = match direction {
+        let range = create_seek_range(start, direction);
+        let (found, iter_box) = match direction {
             IterationDirection::Forwards => {
-                Box::new(index_rows.range(range)) as IndexRowIterator<'_, A>
+                let mut rows = index_rows.range(range).peekable();
+                let found =
+                    self.first_visible_index_row(snapshot, index_id, &mut rows, exact_key.as_ref());
+                (found, Box::new(rows) as IndexRowIterator<'_, A>)
             }
             IterationDirection::Backwards => {
-                Box::new(index_rows.range(range).rev()) as IndexRowIterator<'_, A>
+                let mut rows = index_rows.range(range).rev().peekable();
+                let found =
+                    self.first_visible_index_row(snapshot, index_id, &mut rows, exact_key.as_ref());
+                (found, Box::new(rows) as IndexRowIterator<'_, A>)
             }
         };
         *index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
-        let mv_store_iterator = index_iterator
-            .as_mut()
-            .expect("index_iterator was assigned above if it was None");
-        Ok(self.find_next_visible_index_row(snapshot, index_id, mv_store_iterator))
+        Ok(found)
+    }
+
+    /// The first visible entry of a seek. For an eq-only seek, that is the
+    /// first visible entry matching `exact_key`, read without consuming the
+    /// entry after the matching ones.
+    fn first_visible_index_row<'a, I>(
+        &self,
+        snapshot: MvccReadSnapshot,
+        index_id: MVTableId,
+        rows: &mut Peekable<I>,
+        exact_key: Option<&SortableIndexKey>,
+    ) -> Option<(RowID, RowVersions<A>)>
+    where
+        I: Iterator<Item = IndexRowEntry<'a, A>>,
+    {
+        let Some(exact_key) = exact_key else {
+            return self.find_next_visible_index_row(snapshot, index_id, rows);
+        };
+        while rows
+            .peek()
+            .is_some_and(|row| row.key().as_ref() == exact_key)
+        {
+            let row = rows.next().expect("the entry was just peeked");
+            if let Some(visible_row) = self.find_last_visible_index_version(snapshot, index_id, row)
+            {
+                return Some(visible_row);
+            }
+        }
+        None
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
