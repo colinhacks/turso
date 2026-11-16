@@ -19495,7 +19495,7 @@ where
     }
 }
 
-pub fn with_header_mut<T, F>(
+fn with_header_mut<T, F>(
     pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
