@@ -498,6 +498,26 @@ fn mvcc_vacuum_gate_blocks_new_read_and_write_tx() {
 }
 
 #[test]
+fn mvcc_pragma_page_size_cannot_change_during_first_page_write() {
+    let db = MvccTestDb::new();
+    let pager = db.conn.pager.load().clone();
+    let crate::IOResult::IO(pending) = pager.maybe_allocate_page1().unwrap() else {
+        panic!("first page allocation must write page 1");
+    };
+
+    db.conn.execute("PRAGMA page_size = 512").unwrap();
+    let page_size = pager.get_page_size_unchecked().get();
+    assert_eq!(
+        db.mvcc_store
+            .with_header(|header| header.page_size.get(), None)
+            .unwrap(),
+        page_size
+    );
+    pending.wait(db.db.io.as_ref()).unwrap();
+    db.db.io.block(|| pager.maybe_allocate_page1()).unwrap();
+}
+
+#[test]
 fn mvcc_reset_after_vacuum_installs_header_and_rootpages() {
     let db = MvccTestDb::new();
     db.conn

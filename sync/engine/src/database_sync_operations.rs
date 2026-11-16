@@ -4228,6 +4228,199 @@ mod tests {
         Result,
     };
 
+    mod restore_reservation {
+        use super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use turso_core::{
+            ConnectOpts, Database, DatabaseOpts, EncryptionKey, EncryptionOpts, OpenOptions,
+        };
+
+        struct PausedCompletion {
+            inner: TestCompletion,
+            ready: Arc<AtomicBool>,
+        }
+
+        impl DataCompletion<u8> for PausedCompletion {
+            type DataPollResult = TestPollResult;
+            fn status(&self) -> Result<Option<u16>> {
+                if self.ready.load(Ordering::SeqCst) {
+                    self.inner.status()
+                } else {
+                    Ok(None)
+                }
+            }
+            fn poll_data(&self) -> Result<Option<TestPollResult>> {
+                self.inner.poll_data()
+            }
+            fn is_done(&self) -> Result<bool> {
+                self.inner.is_done()
+            }
+        }
+
+        struct PausedHttpIo {
+            inner: TestHttpIo,
+            ready: Arc<AtomicBool>,
+        }
+
+        impl SyncEngineIo for PausedHttpIo {
+            type DataCompletionBytes = PausedCompletion;
+            type DataCompletionTransform = TestTransformCompletion;
+            fn full_read(&self, _: &str) -> Result<PausedCompletion> {
+                panic!("unexpected file read")
+            }
+            fn full_write(&self, _: &str, _: Vec<u8>) -> Result<PausedCompletion> {
+                panic!("unexpected file write")
+            }
+            fn transform(&self, _: Vec<DatabaseRowMutation>) -> Result<TestTransformCompletion> {
+                panic!("unexpected transform")
+            }
+            fn http(
+                &self,
+                url: Option<&str>,
+                method: &str,
+                path: &str,
+                body: Option<Vec<u8>>,
+                headers: &[(&str, &str)],
+            ) -> Result<PausedCompletion> {
+                Ok(PausedCompletion {
+                    inner: self.inner.http(url, method, path, body, headers)?,
+                    ready: self.ready.clone(),
+                })
+            }
+            fn add_io_callback(&self, _: Box<dyn FnMut() -> bool + Send>) {}
+            fn step_io_callbacks(&self) {}
+        }
+
+        #[test]
+        fn bootstrap_reservation_excludes_encrypted_open_while_http_waits() {
+            const KEY: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+            let options = || {
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(DatabaseOpts::new().with_encryption(true))
+                    .encryption(EncryptionOpts {
+                        cipher: "aegis256".into(),
+                        hexkey: KEY.into(),
+                    })
+            };
+            for cancel in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("bootstrap.db");
+                let core_io: Arc<dyn turso_core::IO> =
+                    Arc::new(turso_core::PlatformIO::new().unwrap());
+                let db =
+                    Database::open(core_io.clone(), path.to_str().unwrap(), options()).unwrap();
+                let owner = db
+                    .connect(
+                        ConnectOpts::new(turso_core::SessionRole::Superuser).with_encryption_key(
+                            Some(EncryptionKey::from_hex_string(KEY).unwrap()),
+                        ),
+                    )
+                    .unwrap();
+                owner.execute("CREATE TABLE secrets(value TEXT)").unwrap();
+                owner
+                    .execute("INSERT INTO secrets VALUES ('protected value')")
+                    .unwrap();
+                owner.close().unwrap();
+                drop((owner, db));
+                let before = std::fs::read(&path).unwrap();
+                let header = PullUpdatesRespProtoBody {
+                    server_revision: "revision".into(),
+                    db_size: 1,
+                    stream_kind: PullUpdatesStreamKind::Pages as i32,
+                    raw_encoding: Some(PageSetRawEncodingProto::default()),
+                    ..Default::default()
+                };
+                let remote_page = vec![7; super::super::PAGE_SIZE];
+                let mut response = header.encode_length_delimited_to_vec();
+                response.extend_from_slice(
+                    &PageData {
+                        page_id: 0,
+                        encoded_page: remote_page.clone().into(),
+                    }
+                    .encode_length_delimited_to_vec(),
+                );
+                let ready = Arc::new(AtomicBool::new(false));
+                let http = Arc::new(PausedHttpIo {
+                    inner: TestHttpIo {
+                        response,
+                        chunk: 17,
+                        ..Default::default()
+                    },
+                    ready: ready.clone(),
+                });
+                let mut generator = genawaiter::sync::Gen::new({
+                    let path = path.clone();
+                    let core_io = core_io.clone();
+                    move |coro| async move {
+                        let coro: Coro<()> = coro.into();
+                        let stats = SyncEngineIoStats::new(http);
+                        let ctx = SyncOperationCtx::new(&coro, &stats, None, None);
+                        super::super::bootstrap_db_file_v1(
+                            &ctx,
+                            &core_io,
+                            path.to_str().unwrap(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                    }
+                });
+                assert!(matches!(
+                    generator.resume_with(Ok(())),
+                    genawaiter::GeneratorState::Yielded(_)
+                ));
+                assert!(
+                    Database::open(core_io.clone(), path.to_str().unwrap(), options()).is_err(),
+                    "encrypted open must be excluded across the HTTP wait"
+                );
+                assert!(
+                    Database::do_open(core_io.clone(), path.to_str().unwrap(), options()).is_err()
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                if cancel {
+                    drop(generator);
+                    let db =
+                        Database::open(core_io.clone(), path.to_str().unwrap(), options()).unwrap();
+                    let owner = db
+                        .connect(
+                            ConnectOpts::new(turso_core::SessionRole::Superuser)
+                                .with_encryption_key(Some(
+                                    EncryptionKey::from_hex_string(KEY).unwrap(),
+                                )),
+                        )
+                        .unwrap();
+                    let mut stmt = owner.prepare("SELECT value FROM secrets").unwrap();
+                    loop {
+                        match stmt.step().unwrap() {
+                            turso_core::StepResult::Row => {
+                                assert_eq!(
+                                    stmt.row().unwrap().get::<String>(0).unwrap(),
+                                    "protected value"
+                                );
+                                break;
+                            }
+                            turso_core::StepResult::IO => core_io.step().unwrap(),
+                            other => panic!("unexpected result: {other:?}"),
+                        }
+                    }
+                } else {
+                    ready.store(true, Ordering::SeqCst);
+                    loop {
+                        match generator.resume_with(Ok(())) {
+                            genawaiter::GeneratorState::Yielded(_) => core_io.step().unwrap(),
+                            genawaiter::GeneratorState::Complete(result) => {
+                                result.unwrap();
+                                break;
+                            }
+                        }
+                    }
+                    assert_eq!(std::fs::read(&path).unwrap(), remote_page);
+                }
+            }
+        }
+    }
+
     struct TestPollResult(Vec<u8>);
 
     impl DataPollResult<u8> for TestPollResult {

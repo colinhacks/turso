@@ -1652,15 +1652,38 @@ impl SharedPagerState {
     }
 
     pub(crate) fn initialized(&self) -> bool {
-        self.init_page_1.load().is_none()
+        #[cfg(shuttle)]
+        crate::sync::encryption_schedule_point(true);
+        let initialized = self.init_page_1.load().is_none();
+        #[cfg(shuttle)]
+        {
+            crate::thread::yield_now();
+            crate::sync::encryption_schedule_point(false);
+        }
+        initialized
     }
 
     fn initial_page_1(&self) -> Option<PageRef> {
-        self.init_page_1.load_full()
+        #[cfg(shuttle)]
+        crate::sync::encryption_schedule_point(true);
+        let page = self.init_page_1.load_full();
+        #[cfg(shuttle)]
+        {
+            crate::thread::yield_now();
+            crate::sync::encryption_schedule_point(false);
+        }
+        page
     }
 
     fn set_initial_page_1(&self, page: Option<PageRef>) {
+        #[cfg(shuttle)]
+        crate::sync::encryption_schedule_point(true);
         self.init_page_1.store(page);
+        #[cfg(shuttle)]
+        {
+            crate::thread::yield_now();
+            crate::sync::encryption_schedule_point(false);
+        }
     }
 
     pub(crate) fn is_init_locked(&self) -> bool {
