@@ -6414,6 +6414,10 @@ impl Pager {
         Ok(IOResult::Done(result))
     }
 
+    pub(crate) fn shares_database_state(&self, shared: &Arc<SharedPagerState>) -> bool {
+        Arc::ptr_eq(&self.shared, shared)
+    }
+
     pub fn is_encryption_ctx_set(&self) -> bool {
         self.io_ctx.read().encryption_context().is_some()
     }
