@@ -579,6 +579,14 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// type, read before the MVCC peek was taken.
     /// See [`Self::reseek_mvcc_if_rows_changed`].
     mvcc_peek_epoch: u64,
+    /// Set when an exact-match seek found no visible MVCC row for its key. The
+    /// MVCC iterator then stands at the first row past the key, which the next
+    /// step reads.
+    mvcc_peek_stopped_at_seek_key: bool,
+    /// Set when an exact-match seek found no visible B-tree row for its key,
+    /// although rows may follow it. The B-tree cursor then stands on, or next
+    /// to, the first row past the key, which the next step checks.
+    btree_peek_stopped_at_seek_key: bool,
 }
 
 pub enum NextRowidResult {
@@ -648,6 +656,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
             mvcc_peek_epoch: 0,
+            mvcc_peek_stopped_at_seek_key: false,
+            btree_peek_stopped_at_seek_key: false,
         })
     }
 
@@ -1220,6 +1230,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Reset dual peek state (called on rewind/last/seek)
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
+        self.mvcc_peek_stopped_at_seek_key = false;
+        self.btree_peek_stopped_at_seek_key = false;
         self.mvcc_peek_epoch = self.mvcc_rows_epoch();
         self.eq_seek_row = None;
         // The forward scan is monotonic; a reposition invalidates it.
@@ -1253,6 +1265,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                     match seek_result {
                         SeekResult::NotFound => {
                             self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                            // An exact-match seek that misses leaves the B-tree
+                            // cursor where the key would be.
+                            self.btree_peek_stopped_at_seek_key = op.eq_only();
                             return Ok(IOResult::Done(()));
                         }
                         SeekResult::TryAdvance => {
@@ -1315,7 +1330,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                             ));
                             inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
                         }
-                        _ => {
+                        Some(_) => {
+                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+                            self.btree_peek_stopped_at_seek_key = true;
+                            return Ok(IOResult::Done(()));
+                        }
+                        None => {
                             self.dual_peek.btree_peek = CursorPeek::Exhausted;
                             return Ok(IOResult::Done(()));
                         }
@@ -1323,6 +1343,50 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 }
             }
         }
+    }
+
+    /// An exact-match seek stops each source at the end of its rows for the
+    /// key. Before a step in the seek's direction moves past them, this reads
+    /// each stopped source's next row from where the seek left it.
+    fn read_past_seek_key(&mut self, dir: IterationDirection) -> IOResultOr<()> {
+        if !self.mvcc_peek_stopped_at_seek_key && !self.btree_peek_stopped_at_seek_key {
+            return Ok(IOResult::Done(()));
+        }
+        let CursorPosition::Loaded { row_id, .. } = &self.current_pos else {
+            self.mvcc_peek_stopped_at_seek_key = false;
+            self.btree_peek_stopped_at_seek_key = false;
+            return Ok(IOResult::Done(()));
+        };
+        let key = row_id.row_id.clone();
+        if self.mvcc_peek_stopped_at_seek_key {
+            self.mvcc_peek_stopped_at_seek_key = false;
+            self.advance_mvcc_iterator();
+        }
+        if self.btree_peek_stopped_at_seek_key {
+            if self.state.is_none() {
+                // Check the row the B-tree cursor stands on, or step to the
+                // next one when it stands past the end of its page.
+                let first = if self.btree_cursor.has_record() {
+                    SeekBtreeState::CheckRow
+                } else {
+                    SeekBtreeState::AdvanceBTree
+                };
+                self.state = Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(first), dir));
+                inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
+            }
+            let op = match dir {
+                IterationDirection::Forwards => SeekOp::GT,
+                IterationDirection::Backwards => SeekOp::LT,
+            };
+            let seek_key = match &key {
+                RowKey::Int(rowid) => SeekKey::TableRowId(*rowid),
+                RowKey::Record(record) => SeekKey::IndexKey(record.key.clone()),
+            };
+            return_if_io!(self.seek_btree_and_set_peek(seek_key, op));
+            self.btree_peek_stopped_at_seek_key = false;
+            self.state = None;
+        }
+        Ok(IOResult::Done(()))
     }
 
     /// Initialize MVCC iterator for forward iteration (used when next() is called without rewind())
@@ -1443,6 +1507,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.read_past_seek_key(IterationDirection::Forwards));
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             if matches!(self.current_pos, CursorPosition::BeforeFirst) {
@@ -1540,6 +1605,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.read_past_seek_key(IterationDirection::Backwards));
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             if matches!(self.current_pos, CursorPosition::End) {
@@ -1684,28 +1750,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         //   column of a UNIQUE index with no NULL), so the current row is the first and only match
         // - the cursor is already correctly positioned on a visible version
         //
-        // This is because in the situation where the following are true:
-        //
-        // - the loop's seek is a range seek (not eq_only, ex: `DELETE ... WHERE a > 1000`)
-        // - the seek_key for the current iteration is in MvStore, but not in the b-tree
-        // - some matching rows are b-tree-resident. This can happen if there are inserts, then a
-        //   checkpoint (moving all previous rows to the b-tree), and then more inserts (only in MvStore).
-        //
-        // then the following problem could happen:
-        //
-        // 1. we seek to the first matching key using `SeekOp::GT { eq_only: false }`, so far so good.
-        // 2. op_idx_delete forces a eq_only seek on the cursor.
-        //    In the case of a delete using an index, this is redundant,
-        //    because the delete loop works by seeking the index and then Insn::DeferredSeek'ing the
-        //    table, so the index cursor is already correctly positioned.
-        // 3. we seek the mvcc cursor (self) and find the row
-        // 4. we seek btree_cursor, don't find the row, and set it to Exhausted immediately because
-        //    it's an eq_only seek, EVEN THOUGH the seek from step 1 would still have matched rows
-        //    in the b-tree.
-        // 5. eventually, the mvcc cursor runs out. When this happens, since btree_cursor is already
-        //    exhausted, current_pos becomes CursorPosition::End, and the next Insn::Next
-        //    INCORRECTLY finds the index cursor exhausted and breaks out of the delete loop, even
-        //    though there are still b-tree-resident rows to delete.
+        // A delete loop that walks an index hits this on every row: op_idx_delete seeks the key
+        // of the row the loop's cursor is already on.
         if self.state.is_none() && op.eq_only() {
             if let CursorPosition::Loaded {
                 row_id, in_btree, ..
@@ -1832,6 +1878,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             }
                         }
                     }
+
+                    self.mvcc_peek_stopped_at_seek_key =
+                        op.eq_only() && self.dual_peek.mvcc_exhausted();
 
                     // Move to btree seek state
                     self.state.replace(MvccLazyCursorState::Seek(
