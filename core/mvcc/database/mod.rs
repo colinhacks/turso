@@ -53,6 +53,7 @@ use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::{BTreeMap, HashMap as StdHashMap};
 use std::fmt::Debug;
+use std::iter::Peekable;
 use std::marker::PhantomData;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
@@ -6316,43 +6317,72 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
         let table_id = start.table_id;
-        let iter_box = {
-            let range = if eq_only {
-                // An eq-only rowid seek (point lookup, NotExists / rowid-uniqueness
-                // probe) only cares about the single key `start`. Bound BOTH ends of
-                // the range to that key so the skiplist walk stops immediately instead
-                // of scanning forward over every invisible neighbor until it happens to
-                // find the next visible row. Without this bound a single probe costs
-                // O(pending invisible versions), which compounds into quadratic work
-                // when each row of a concurrent batch insert pays it. This mirrors the
-                // eq-only bound in `seek_index`. The cursor's final position is still
-                // decided by `PickWinner` from the merged MVCC/B-tree peeks, so bounding
-                // the range here does not change where the cursor lands.
-                (Bound::Included(start.clone()), Bound::Included(start))
-            } else {
-                let start = if inclusive {
-                    Bound::Included(start)
-                } else {
-                    Bound::Excluded(start)
-                };
-                create_seek_range(start, direction)
-            };
-            match direction {
-                IterationDirection::Forwards => {
-                    Box::new(self.rows.range(range)) as TableRowIterator<'_, A>
-                }
-                IterationDirection::Backwards => {
-                    Box::new(self.rows.range(range).rev()) as TableRowIterator<'_, A>
-                }
+        // An eq-only rowid seek (point lookup, NotExists / rowid-uniqueness
+        // probe) only reads the row at `start`: it stops at the first row past
+        // it instead of scanning forward over every invisible neighbor until it
+        // happens to find the next visible row. Without that stop a single probe
+        // costs O(pending invisible versions), which compounds into quadratic work
+        // when each row of a concurrent batch insert pays it. The iterator is not
+        // bounded to `start`, so a step past `start` reads on from there.
+        let exact_key = eq_only.then(|| start.clone());
+        let start = if inclusive {
+            Bound::Included(start)
+        } else {
+            Bound::Excluded(start)
+        };
+        let range = create_seek_range(start, direction);
+        let (found, iter_box) = match direction {
+            IterationDirection::Forwards => {
+                let mut rows = self.rows.range(range).peekable();
+                let found = self.first_visible_table_row(
+                    snapshot,
+                    &mut rows,
+                    table_id,
+                    exact_key.as_ref(),
+                    take_payload,
+                );
+                (found, Box::new(rows) as TableRowIterator<'_, A>)
+            }
+            IterationDirection::Backwards => {
+                let mut rows = self.rows.range(range).rev().peekable();
+                let found = self.first_visible_table_row(
+                    snapshot,
+                    &mut rows,
+                    table_id,
+                    exact_key.as_ref(),
+                    take_payload,
+                );
+                (found, Box::new(rows) as TableRowIterator<'_, A>)
             }
         };
         *table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
+        found
+    }
 
-        let mv_store_iterator = table_iterator
-            .as_mut()
-            .expect("table_iterator was assigned above if it was None");
-
-        self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload)
+    /// The first visible row of a seek. For an eq-only seek, that is the
+    /// visible row at `exact_key`, read without consuming the row after it.
+    fn first_visible_table_row<'a, I>(
+        &self,
+        snapshot: MvccReadSnapshot,
+        rows: &mut Peekable<I>,
+        table_id: MVTableId,
+        exact_key: Option<&RowID>,
+        take_payload: bool,
+    ) -> Option<(RowID, RowVersions<A>, Option<Row>)>
+    where
+        I: Iterator<Item = TableRowEntry<'a, A>>,
+    {
+        let Some(exact_key) = exact_key else {
+            return self.find_next_visible_table_row(snapshot, rows, table_id, take_payload);
+        };
+        while rows.peek().is_some_and(|row| row.key() == exact_key) {
+            let row = rows.next().expect("the row was just peeked");
+            if let Some(visible_row) = self.find_last_visible_version(snapshot, &row, take_payload)
+            {
+                return Some(visible_row);
+            }
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
