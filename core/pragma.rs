@@ -255,11 +255,11 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PragmaVirtualTable {
-    pub(crate) pragma_name: String,
-    visible_column_count: usize,
-    max_arg_count: usize,
-    has_pragma_arg: bool,
+pub struct PragmaVirtualTable {
+    pub pragma_name: String,
+    pub visible_column_count: usize,
+    pub max_arg_count: usize,
+    pub has_pragma_arg: bool,
 }
 
 impl PragmaVirtualTable {
@@ -322,7 +322,7 @@ impl PragmaVirtualTable {
         )
     }
 
-    pub(crate) fn open(&self, conn: Arc<Connection>) -> crate::Result<PragmaVirtualTableCursor> {
+    pub fn open(&self, conn: Arc<Connection>) -> crate::Result<PragmaVirtualTableCursor> {
         Ok(PragmaVirtualTableCursor {
             pragma_name: self.pragma_name.clone(),
             pos: 0,
@@ -406,11 +406,12 @@ pub struct PragmaVirtualTableCursor {
 }
 
 impl PragmaVirtualTableCursor {
-    pub(crate) fn rowid(&self) -> i64 {
+    pub fn rowid(&self) -> i64 {
         self.pos as i64
     }
 
-    pub(crate) fn next(&mut self) -> crate::Result<bool> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> crate::Result<bool> {
         let stmt = self
             .stmt
             .as_mut()
@@ -484,7 +485,7 @@ impl PragmaVirtualTableCursor {
             .map(|namespace| namespace.name)
     }
 
-    pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
+    pub fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
         if args.len() > self.max_arg_count {
             return Err(LimboError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",
@@ -544,41 +545,6 @@ impl PragmaVirtualTableCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-    use crate::{ConnectOpts, Database, EngineDialect, MemoryIO};
-
-    #[test]
-    fn filter_starts_each_pragma_scan_at_rowid_one() {
-        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
-        let db =
-            Database::open_file(io, crate::util::MEMORY_PATH, Arc::new(EngineDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE scan_target(first, second)")
-            .unwrap();
-
-        let pragma_vtab = PragmaVirtualTable {
-            pragma_name: "table_info".to_string(),
-            visible_column_count: 6,
-            max_arg_count: 2,
-            has_pragma_arg: true,
-        };
-        let mut cursor = pragma_vtab.open(conn).unwrap();
-
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
-        assert_eq!(cursor.rowid(), 1);
-        assert!(cursor.next().unwrap());
-        assert_eq!(cursor.rowid(), 2);
-        assert!(!cursor.next().unwrap());
-
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
-        assert_eq!(cursor.rowid(), 1);
-    }
 
     #[test]
     fn test_best_index_argv_order_both_hidden_constraints() {

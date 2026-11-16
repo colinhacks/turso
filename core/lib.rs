@@ -55,15 +55,15 @@ mod assert;
 pub mod attach;
 pub mod connection;
 mod connection_hooks;
-mod database;
+pub mod database;
 pub mod dialect;
-mod error;
+pub mod error;
 mod ext;
 mod fast_lock;
 pub mod function;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod functions;
-mod incremental;
+pub mod incremental;
 mod incremental_blob;
 pub use incremental_blob::Blob;
 mod info;
@@ -74,20 +74,20 @@ mod numeric;
 mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
-mod pragma;
+pub mod pragma;
 mod progress;
-mod pseudo;
+pub mod pseudo;
 mod regexp;
 #[cfg(feature = "series")]
 mod series;
 mod stack;
-mod statement;
-mod stats;
+pub mod statement;
+pub mod stats;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
-mod translate;
-mod util;
+pub mod translate;
+pub mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
@@ -112,7 +112,7 @@ use crate::{
     vdbe::metrics::ConnectionMetrics,
 };
 pub use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use schema::Schema;
+pub use schema::Schema;
 use std::time::Duration;
 use storage::sqlite3_ondisk::PageSize;
 use tracing::instrument;
@@ -139,11 +139,9 @@ pub use database::{
     OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
     SharedWalOpenTelemetry,
 };
-pub(crate) use database::{DatabaseCatalog, InitState};
+pub use database::{DatabaseCatalog, InitState};
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-#[cfg(test)]
-pub(crate) use dialect::EngineDialect;
 pub use dialect::{CatalogChange, Dialect, NewOwner, OwnerColumn};
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
@@ -262,6 +260,6 @@ pub enum TempStore {
     Memory = 2,
 }
 
-pub(crate) type MvStore = mvcc::MvStore<mvcc::MvccClock, alloc::DynAllocator>;
+pub type MvStore = mvcc::MvStore<mvcc::MvccClock, alloc::DynAllocator>;
 
 pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::MvccClock, alloc::DynAllocator>;

@@ -11,32 +11,32 @@ pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
 pub(crate) mod catalog;
-pub(crate) mod collate;
+pub mod collate;
 mod compound_select;
 pub(crate) mod delete;
 pub(crate) mod display;
-pub(crate) mod emitter;
+pub mod emitter;
 pub mod eqp;
-pub(crate) mod expr;
-pub(crate) mod expr_context;
+pub mod expr;
+pub mod expr_context;
 pub(crate) mod expression_index;
 pub(crate) mod fkeys;
 pub(crate) mod group_by;
-pub(crate) mod index;
+pub mod index;
 pub(crate) mod insert;
 pub(crate) mod integrity_check;
 pub(crate) mod main_loop;
-pub(crate) mod optimizer;
+pub mod optimizer;
 pub(crate) mod order_by;
-pub(crate) mod plan;
-pub(crate) mod planner;
+pub mod plan;
+pub mod planner;
 pub(crate) mod pragma;
 pub(crate) mod recursive_cte;
 pub(crate) mod result_column_types;
 pub(crate) mod result_row;
-pub(crate) mod roles;
+pub mod roles;
 pub(crate) mod rollback;
-pub(crate) mod row_security;
+pub mod row_security;
 pub(crate) mod schema;
 pub(crate) mod select;
 pub(crate) mod sequence;
@@ -151,7 +151,8 @@ pub fn translate(
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
         if is_engine_statement {
-            Arc::new(crate::dialect::EngineDialect) as Arc<dyn crate::dialect::Dialect>
+            Arc::new(crate::dialect::DefaultDialect::new(connection.dialect()))
+                as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
         },
@@ -711,14 +712,6 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::TryClone;
-    use crate::io::MemoryIO;
-    use crate::namespace::NamespaceId;
-    use crate::schema::{BTreeTable, Table, SQLITE_SEQUENCE_TABLE_NAME};
-    use crate::security::roles::SessionRole;
-    use crate::ConnectOpts;
-    use crate::Database;
-    use crate::EngineDialect;
 
     #[test]
     fn view_expansion_restores_context_after_errors() {
@@ -760,149 +753,5 @@ mod tests {
             })
             .unwrap();
         assert!(program.is_cte_being_defined("caller"));
-    }
-
-    /// Verify that REGEXP produces the correct error when no regexp function is registered.
-    #[test]
-    fn test_regexp_no_function_registered() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let schema = db.schema.lock().clone();
-        let pager = conn.pager.load().clone();
-
-        // Use an empty SymbolTable so regexp() is not available.
-        let empty_syms = SymbolTable::new();
-        let cmd = crate::dialect::engine::parse_statement("SELECT 'x' REGEXP 'y'")
-            .transpose()
-            .unwrap()
-            .unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
-        };
-
-        let result = translate(
-            &schema,
-            stmt,
-            pager,
-            conn,
-            &empty_syms,
-            QueryMode::Normal,
-            "",
-            crate::statement::StatementOrigin::Root,
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("no such function: regexp"),
-            "expected 'no such function: regexp', got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_insert_autoincrement_with_malformed_sqlite_sequence_is_corrupt() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-            .unwrap();
-
-        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        let seq_root_page = schema
-            .get_btree_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME)
-            .expect("sqlite_sequence should exist after creating AUTOINCREMENT table")
-            .root_page;
-        let malformed_seq =
-            BTreeTable::from_sql("CREATE TABLE sqlite_sequence(name)", seq_root_page)
-                .expect("malformed sqlite_sequence SQL should parse");
-        schema.insert_table(
-            NamespaceId::ROOT,
-            SQLITE_SEQUENCE_TABLE_NAME.to_string(),
-            Arc::new(Table::BTree(Arc::new(malformed_seq))),
-        );
-
-        let pager = conn.pager.load().clone();
-        let syms = SymbolTable::new();
-
-        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
-            .transpose()
-            .unwrap()
-            .unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
-        };
-
-        let err = translate(
-            &schema,
-            stmt,
-            pager,
-            conn,
-            &syms,
-            QueryMode::Normal,
-            "",
-            crate::statement::StatementOrigin::Root,
-        )
-        .expect_err("translation should fail with malformed sqlite_sequence");
-        match err {
-            crate::LimboError::Corrupt(msg) => {
-                assert!(
-                    msg.contains("sqlite_sequence"),
-                    "expected sqlite_sequence corruption error, got: {msg}"
-                );
-            }
-            other => panic!("expected LimboError::Corrupt, got: {other}"),
-        }
-    }
-
-    #[test]
-    fn test_insert_autoincrement_with_missing_sqlite_sequence_is_corrupt() {
-        let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(EngineDialect)).unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
-            .unwrap();
-
-        let mut schema = db.schema.lock().as_ref().try_clone().unwrap();
-        schema.take_table(NamespaceId::ROOT, SQLITE_SEQUENCE_TABLE_NAME);
-
-        let pager = conn.pager.load().clone();
-        let syms = SymbolTable::new();
-
-        let cmd = crate::dialect::engine::parse_statement("INSERT INTO t(v) VALUES('x')")
-            .transpose()
-            .unwrap()
-            .unwrap();
-        let stmt = match cmd {
-            ast::Cmd::Stmt(s) => s,
-            _ => panic!("expected statement"),
-        };
-
-        let err = translate(
-            &schema,
-            stmt,
-            pager,
-            conn,
-            &syms,
-            QueryMode::Normal,
-            "",
-            crate::statement::StatementOrigin::Root,
-        )
-        .expect_err("translation should fail with missing sqlite_sequence");
-        match err {
-            crate::LimboError::Corrupt(msg) => {
-                assert!(
-                    msg.contains("missing sqlite_sequence"),
-                    "expected missing sqlite_sequence error, got: {msg}"
-                );
-            }
-            other => panic!("expected LimboError::Corrupt, got: {other}"),
-        }
     }
 }

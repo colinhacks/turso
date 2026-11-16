@@ -815,13 +815,13 @@ impl std::fmt::Debug for ActiveOpState {
 }
 
 #[derive(Debug, Default)]
-struct ActiveOpStateSlot {
+pub struct ActiveOpStateSlot {
     state: ActiveOpState,
 }
 
 macro_rules! active_state_accessor {
     ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
-        fn $name(&mut self) -> &mut $ty {
+        pub fn $name(&mut self) -> &mut $ty {
             if matches!(self.state, ActiveOpState::None) {
                 // None owns nothing, so skip the drop glue of the enum that
                 // a plain assignment would run on the old value.
@@ -1075,7 +1075,7 @@ pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
-    pub(crate) cursors: Vec<Option<Cursor>>,
+    pub cursors: Vec<Option<Cursor>>,
     /// Database id associated with each opened cursor. Ephemeral and pseudo
     /// cursors have no database id.
     cursor_databases: Vec<Option<usize>>,
@@ -1146,7 +1146,7 @@ pub struct ProgramState {
     pub(crate) current_time: Option<crate::WallClockInstant>,
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
-    active_op_state: ActiveOpStateSlot,
+    pub active_op_state: ActiveOpStateSlot,
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
@@ -1158,11 +1158,11 @@ pub struct ProgramState {
     pub(crate) populate_matviews_state: Option<PopulateMatViewsState>,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
-    pub(crate) auto_txn_cleanup: TxnCleanup,
+    pub auto_txn_cleanup: TxnCleanup,
     pub explain_state: RwLock<ExplainState>,
     /// Scratch buffer for [Insn::HashDistinct] to avoid per-row allocations.
     distinct_key_values: Vec<Value>,
-    hash_tables: HashMap<usize, HashTable>,
+    pub hash_tables: HashMap<usize, HashTable>,
     /// TempFile handles for ephemeral cursors, keyed by cursor_id.
     /// Dropping removes the temp file from disk.
     ephemeral_temp_files: HashMap<usize, TempFile>,
@@ -2023,7 +2023,7 @@ impl ProgramState {
             .load(Ordering::Acquire)
     }
 
-    pub(crate) fn immediate_foreign_key_error(&self) -> LimboError {
+    pub fn immediate_foreign_key_error(&self) -> LimboError {
         self.fk_immediate_violation.clone().unwrap_or_else(|| {
             LimboError::ForeignKeyConstraint("FOREIGN KEY constraint failed".to_string())
         })
@@ -2195,7 +2195,7 @@ pub struct PreparedProgram {
 
 #[derive(Clone)]
 pub struct Program {
-    pub(crate) prepared: Arc<PreparedProgram>,
+    pub prepared: Arc<PreparedProgram>,
     pub connection: Arc<Connection>,
 }
 

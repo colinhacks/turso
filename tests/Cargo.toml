@@ -63,6 +63,12 @@ turso_macros.workspace = true
 crossbeam-epoch = "0.9.18"
 rustc-hash = "2.0"
 sorted-vec = "0.8.6"
+quickcheck = { version = "1.0", default-features = false }
+quickcheck_macros = { version = "1.0", default-features = false }
+tantivy = { version = "0.26.2" }
+pack1 = { version = "1.0.0", features = ["bytemuck"] }
+crc32c = "0.6.8"
+libc = { version = "0.2.172" }
 
 [features]
 default = [
@@ -90,8 +96,13 @@ autovacuum = ["turso_core/autovacuum"]
 conn_raw_api = []
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
+simulator = ["turso_core/simulator"]
+allocation_metric = ["turso_core/allocation_metric"]
 fts = ["turso_core/fts"]
 io_memory_yield = ["turso_core/io_memory_yield"]
 io_uring = ["turso_core/io_uring"]
 win_iocp = ["turso_core/experimental_win_iocp"]
 pure-rust-crypto = ["turso_core/pure-rust-crypto"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)'] }

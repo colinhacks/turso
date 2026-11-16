@@ -293,13 +293,13 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// released if the state machine fails.
     lock_states: LockStates,
     /// The highest transaction ID that has been made durable in the WAL in a previous checkpoint.
-    durable_txid_max_old: Option<NonZeroU64>,
+    pub durable_txid_max_old: Option<NonZeroU64>,
     /// The highest transaction ID that will be made durable in the WAL in the current checkpoint.
     durable_txid_max_new: u64,
     /// Pager used for writing to the B-tree
     pager: Arc<Pager>,
     /// MVCC store containing the row versions.
-    mvstore: Arc<MvStore<Clock, A>>,
+    pub mvstore: Arc<MvStore<Clock, A>>,
     /// Connection to the database
     connection: Arc<Connection>,
     /// Database whose pager and schema this checkpoint is writing.
@@ -311,7 +311,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     checkpoint_lock: Arc<TursoRwLock>,
     /// All committed versions to write to the B-tree, with the `RowID` of their chain.
     /// In the case of CREATE TABLE / DROP TABLE ops, contains a [SpecialWrite] to create/destroy the B-tree.
-    write_set: Vec<(RowID, RowVersion, Option<SpecialWrite>)>,
+    pub write_set: Vec<(RowID, RowVersion, Option<SpecialWrite>)>,
     /// State machine for writing rows to the B-tree
     write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
     /// State machine for deleting rows from the B-tree
@@ -373,7 +373,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Sequence deletes recorded in passive mode; applied in the publish window.
     pending_seq_deletes: Vec<RowID>,
     /// Collection upper bound (`last_committed_tx_ts` at snapshot). `u64::MAX` = no bound.
-    snapshot_ts: u64,
+    pub snapshot_ts: u64,
     build_local_schema_sm: Option<StateMachine<BuildLocalSchemaViewStateMachine<Clock, A>>>,
     build_local_schema_began_read_tx: bool,
     /// Snapshot-consistent schema built at `snapshot_ts`; drives `index_id_to_index` in PASSIVE mode.
@@ -1188,7 +1188,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     ///      If the row didn't exist in the database file and was deleted, we can simply not write it.
-    fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
+    pub fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
         let mut processed = 0;
         loop {
             let full_scan = self.full_scan_generation.is_some();
@@ -1658,7 +1658,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(())
     }
 
-    fn prune_dirty_keys(&mut self) -> Option<IOCompletions> {
+    pub fn prune_dirty_keys(&mut self) -> Option<IOCompletions> {
         let mvstore = self.mvstore.clone();
         let end = self.prune_candidates.len().min(
             self.prune_cursor
@@ -3968,7 +3968,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::{Row, SortableIndexKey};
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
@@ -4152,10 +4151,6 @@ mod tests {
         (key_arc, row_version)
     }
 
-    fn committed_table_row_version(table_id: MVTableId, rowid: i64) -> (RowID, RowVersion) {
-        table_row_version(table_id, rowid, 1, Some(5), None, false)
-    }
-
     fn table_row_version(
         table_id: MVTableId,
         rowid: i64,
@@ -4176,27 +4171,6 @@ mod tests {
             materialized_at: crate::mvcc::database::WalPos::ORIGIN,
         };
         (row.id, version)
-    }
-
-    fn checkpoint_for_collect_tests(
-    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
-        let db = MvccTestDbNoConn::new();
-        let conn = db.connect();
-        let mvstore = db.get_mvcc_store();
-        let pager = conn.pager.load().clone();
-        let mut checkpoint = CheckpointStateMachine::new(
-            pager,
-            mvstore,
-            conn.clone(),
-            true,
-            conn.get_sync_mode(),
-            crate::MAIN_DB_ID,
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-        );
-        checkpoint.durable_txid_max_old = NonZeroU64::new(2);
-        checkpoint
     }
 
     #[test]
@@ -4268,108 +4242,5 @@ mod tests {
                 _ => None,
             },
         )
-    }
-
-    fn insert_row_version(
-        mvstore: &crate::sync::Arc<
-            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
-        >,
-        (key, version): (RowID, RowVersion),
-    ) {
-        let mut versions =
-            <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
-                RowVersion,
-                crate::alloc::DynAllocator,
-            >>::new_in(crate::alloc::DynAllocator::default());
-        let stamp = version_stamp(&version);
-        versions.push(version);
-        mvstore
-            .rows
-            .insert(key.clone(), Arc::new(RwLock::new(versions)));
-        mvstore.mark_checkpoint_dirty_key(&key, stamp).unwrap();
-    }
-
-    fn version_stamp(version: &RowVersion) -> u64 {
-        [version.begin(), version.end()]
-            .into_iter()
-            .filter_map(|stamp| match stamp {
-                Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn insert_clean_row_version(
-        mvstore: &crate::sync::Arc<
-            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
-        >,
-        (key, version): (RowID, RowVersion),
-    ) {
-        let mut versions =
-            <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
-                RowVersion,
-                crate::alloc::DynAllocator,
-            >>::new_in(crate::alloc::DynAllocator::default());
-        versions.push(version);
-        mvstore.rows.insert(key, Arc::new(RwLock::new(versions)));
-    }
-
-    fn dirty_table_key(
-        mvstore: &crate::sync::Arc<
-            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
-        >,
-        table_id: MVTableId,
-        rowid: i64,
-    ) -> bool {
-        mvstore
-            .checkpoint_dirty_table_keys
-            .contains_key(&RowID::new(table_id, RowKey::Int(rowid)))
-    }
-
-    #[test]
-    fn collect_table_rows_tolerates_dirty_key_without_chain() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        mvstore
-            .mark_checkpoint_dirty_key(&RowID::new(table_id, RowKey::Int(7)), 5)
-            .unwrap();
-        checkpoint.snapshot_ts = 10;
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-        assert!(checkpoint.write_set.is_empty());
-
-        assert!(checkpoint.prune_dirty_keys().is_none());
-        assert!(!dirty_table_key(&mvstore, table_id, 7));
-    }
-
-    #[test]
-    fn dirty_walk_finds_near_and_far_keys_and_skips_missing_chains() {
-        let mut checkpoint = checkpoint_for_collect_tests();
-        let mvstore = checkpoint.mvstore.clone();
-        let table_id = MVTableId::from(-2);
-        for rowid in 1..=200 {
-            insert_clean_row_version(
-                &mvstore,
-                table_row_version(table_id, rowid, 1, Some(1), None, false),
-            );
-        }
-        for rowid in [1, 2, 3, 150, 200] {
-            insert_row_version(&mvstore, committed_table_row_version(table_id, rowid));
-        }
-        mvstore
-            .mark_checkpoint_dirty_key(&RowID::new(table_id, RowKey::Int(60)), 5)
-            .unwrap();
-        mvstore.rows.remove(&RowID::new(table_id, RowKey::Int(60)));
-
-        while checkpoint.collect_table_rows().unwrap().is_some() {}
-
-        let collected: std::vec::Vec<i64> = checkpoint
-            .write_set
-            .iter()
-            .map(|(row_id, _, _)| row_id.row_id.to_int_or_panic())
-            .collect();
-        assert_eq!(collected, vec![1, 2, 3, 150, 200]);
     }
 }

@@ -83,18 +83,18 @@ use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::RefAct;
 use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, TriggerEvent};
 
-pub(crate) mod access_method;
-pub(crate) mod constraints;
-pub(crate) mod cost;
-mod cost_params;
-pub(crate) mod join;
+pub mod access_method;
+pub mod constraints;
+pub mod cost;
+pub mod cost_params;
+pub mod join;
 pub(crate) mod lift_common_subexpressions;
-pub(crate) mod multi_index;
-pub(crate) mod order;
+pub mod multi_index;
+pub mod order;
 pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
-pub(crate) struct AvailableIndexes {
+pub struct AvailableIndexes {
     indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>>,
 }
 
@@ -160,8 +160,8 @@ impl AvailableIndexes {
             .cloned()
     }
 
-    #[cfg(test)]
-    pub(crate) fn insert_for_table_name(
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn insert_for_table_name(
         &mut self,
         joined_tables: &[JoinedTable],
         table_name: &str,
@@ -175,8 +175,8 @@ impl AvailableIndexes {
             .insert(table_ref.internal_id, indexes);
     }
 
-    #[cfg(test)]
-    pub(crate) fn push_front_for_table_name(
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn push_front_for_table_name(
         &mut self,
         joined_tables: &[JoinedTable],
         table_name: &str,
@@ -2360,7 +2360,7 @@ fn estimate_select_output_rows(plan: &SelectPlan, input_rows: f64, schema: &Sche
 /// comparison then accepts), so nothing below them counts. A comparison or an
 /// arithmetic expression yields NULL when an input is NULL, so for those it
 /// is enough that one input mentions the table.
-fn where_term_rejects_null_row(
+pub fn where_term_rejects_null_row(
     expr: &ast::Expr,
     table_id: ast::TableInternalId,
     table_references: Option<&TableReferences>,
@@ -4977,34 +4977,9 @@ fn build_seek_def(
 
 #[cfg(test)]
 mod tests {
-    use super::{where_term_rejects_null_row, Optimizable};
-    use crate::translate::emitter::{DoubleQuotedDml, Resolver};
-    use crate::{schema::Schema, DatabaseCatalog, RwLock, SymbolTable};
-    use rustc_hash::FxHashMap as HashMap;
-    use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
+    use super::where_term_rejects_null_row;
 
-    fn empty_resolver<'a>(
-        schema: &'a Schema,
-        database_schemas: &'a RwLock<HashMap<usize, crate::sync::Arc<Schema>>>,
-        temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
-        attached_databases: &'a RwLock<DatabaseCatalog>,
-        namespaces: &'a crate::Qualifiers,
-        syms: &'a SymbolTable,
-    ) -> Resolver<'a> {
-        Resolver::new(
-            schema,
-            database_schemas,
-            temp_database,
-            attached_databases,
-            namespaces,
-            syms,
-            true,
-            DoubleQuotedDml::Enabled,
-            crate::sync::Arc::new(crate::EngineDialect),
-            None,
-            crate::security::roles::RoleId::SUPERUSER,
-        )
-    }
+    use turso_parser::ast::{self, Expr, FunctionTail, Name, TableInternalId};
 
     fn no_tail() -> FunctionTail {
         FunctionTail {
@@ -5022,74 +4997,6 @@ mod tests {
             within_group: vec![],
             filter_over: no_tail(),
         }
-    }
-
-    #[test]
-    fn constant_classifier_for_coalesce_with_in_list() {
-        let schema = Schema::new();
-        let syms = SymbolTable::new();
-        let database_schemas = RwLock::new(HashMap::default());
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = crate::Qualifiers::default();
-        let temp_database = RwLock::new(None);
-        let resolver = empty_resolver(
-            &schema,
-            &database_schemas,
-            &temp_database,
-            &attached_databases,
-            &namespaces,
-            &syms,
-        );
-
-        let expr = fn_call(
-            "coalesce",
-            vec![
-                fn_call(
-                    "length",
-                    vec![Expr::Literal(ast::Literal::String("a".into()))],
-                ),
-                Expr::InList {
-                    lhs: Box::new(fn_call(
-                        "hex",
-                        vec![Expr::Literal(ast::Literal::Blob("X'01'".into()))],
-                    )),
-                    not: false,
-                    rhs: vec![Box::new(Expr::Literal(ast::Literal::Blob("X'02'".into())))],
-                },
-            ],
-        );
-
-        assert!(expr.is_constant(&resolver));
-    }
-
-    #[test]
-    fn constant_classifier_for_quote_of_column() {
-        let schema = Schema::new();
-        let syms = SymbolTable::new();
-        let database_schemas = RwLock::new(HashMap::default());
-        let attached_databases = RwLock::new(DatabaseCatalog::new());
-        let namespaces = crate::Qualifiers::default();
-        let temp_database = RwLock::new(None);
-        let resolver = empty_resolver(
-            &schema,
-            &database_schemas,
-            &temp_database,
-            &attached_databases,
-            &namespaces,
-            &syms,
-        );
-
-        let expr = fn_call(
-            "quote",
-            vec![Expr::Column {
-                database: None,
-                table: TableInternalId::default(),
-                column: 0,
-                is_rowid_alias: false,
-            }],
-        );
-
-        assert!(!expr.is_constant(&resolver));
     }
 
     #[test]

@@ -1,10 +1,10 @@
-use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
-use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
-use crate::mvcc::yield_hooks::YieldPointMarker;
-use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::{Connection, LimboError, StepResult, SyncMode, Value};
+use crate::mvcc::store_internals::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
+use turso_core::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
+use turso_core::mvcc::yield_hooks::YieldPointMarker;
+use turso_core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use turso_core::{Connection, LimboError, StepResult, SyncMode, Value};
 
 fn exec_retry(conn: &Arc<Connection>, sql: &str) -> Result<(), LimboError> {
     for _ in 0..100_000 {
@@ -89,7 +89,7 @@ fn commits_batch_into_one_group() {
 }
 
 fn empty_record(end_ts: u64) -> LogRecord {
-    LogRecord::empty(end_ts, crate::alloc::DynAllocator::default())
+    LogRecord::empty(end_ts, turso_core::alloc::DynAllocator::default())
 }
 
 #[test]
@@ -202,7 +202,7 @@ fn failed_mid_batch_leader_does_not_cover_retry_hole() {
     );
 }
 
-fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
+fn step_until_yield_or_done(stmt: &mut turso_core::Statement) -> StepResult {
     for _ in 0..10_000 {
         match stmt.step().unwrap() {
             StepResult::IO => continue,
@@ -212,7 +212,7 @@ fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
     panic!("statement kept returning IO")
 }
 
-fn step_until_done(stmt: &mut crate::Statement) {
+fn step_until_done(stmt: &mut turso_core::Statement) {
     for _ in 0..10_000 {
         match stmt.step().unwrap() {
             StepResult::Done => return,

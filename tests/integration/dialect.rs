@@ -55,30 +55,44 @@ impl Dialect for TestDialect {
         "test"
     }
 
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(sql) = sql.strip_prefix("test: ") {
-            let (cmd, offset) = engine::parse(sql)?;
+            let (cmd, offset) = turso_core::Dialect::parse(&SqliteDialect, sql)?;
             Ok((cmd, "test: ".len() + offset))
         } else {
-            engine::parse(sql)
+            turso_core::Dialect::parse(&SqliteDialect, sql)
         }
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         self.parse_calls.fetch_add(1, Ordering::SeqCst);
         let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-        turso_core::schema::BTreeTable::from_sql(sql, root_page)
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, root_page, false)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
         let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-        engine::parse_table_sql_ast(sql)
+        turso_core::dialect::parse_table_sql_ast(&SqliteDialect, sql)
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
-        engine::table_sql_for_replay(sql)
+        turso_core::dialect::table_sql_for_replay(&SqliteDialect, sql)
     }
 
     fn format_table_sql(
@@ -92,12 +106,12 @@ impl Dialect for TestDialect {
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
         if name.eq_ignore_ascii_case("nvl") {
-            return engine::resolve_builtin_function("coalesce", arg_count);
+            return turso_core::dialect::resolve_builtin_function("coalesce", arg_count);
         }
         if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
             return Ok(Some(Func::Dialect("test_add_one".to_string())));
         }
-        engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
     fn exec_scalar_function(
@@ -116,7 +130,7 @@ impl Dialect for TestDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
+        schema.register_builtin_catalog(self, enable_custom_types)
     }
 
     fn register_native_extensions(&self, options: OpenOptions) -> OpenOptions {
@@ -141,23 +155,37 @@ impl Dialect for StrictTestDialect {
         "strict-test"
     }
 
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-        engine::parse(sql)
+        turso_core::Dialect::parse(&SqliteDialect, sql)
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
         let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-        turso_core::schema::BTreeTable::from_sql(sql, root_page)
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, root_page, false)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
         let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-        engine::parse_table_sql_ast(sql)
+        turso_core::dialect::parse_table_sql_ast(&SqliteDialect, sql)
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
-        engine::table_sql_for_replay(sql)
+        turso_core::dialect::table_sql_for_replay(&SqliteDialect, sql)
     }
 
     fn format_table_sql(
@@ -170,11 +198,11 @@ impl Dialect for StrictTestDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
+        schema.register_builtin_catalog(self, enable_custom_types)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 }
 
@@ -458,7 +486,7 @@ fn create_table_stores_dialect_formatted_sql() {
         // A frontend prepares its translated AST while supplying the
         // original statement text.
         let input = "CREATE TABLE t (x INTEGER)";
-        let stmt = match turso_core::dialect::engine::parse_statement(input)
+        let stmt = match turso_core::dialect::parse_statement(&SqliteDialect, input)
             .unwrap()
             .unwrap()
         {
@@ -510,20 +538,34 @@ impl Dialect for NoFunctionsDialect {
         "nofuncs"
     }
 
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-        engine::parse(sql)
+        turso_core::Dialect::parse(&SqliteDialect, sql)
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-        turso_core::schema::BTreeTable::from_sql(sql, root_page)
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, root_page, false)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-        engine::parse_table_sql_ast(sql)
+        turso_core::dialect::parse_table_sql_ast(&SqliteDialect, sql)
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-        engine::table_sql_for_replay(sql)
+        turso_core::dialect::table_sql_for_replay(&SqliteDialect, sql)
     }
 
     fn format_table_sql(
@@ -540,7 +582,7 @@ impl Dialect for NoFunctionsDialect {
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
+        schema.register_builtin_catalog(self, enable_custom_types)
     }
 
     fn resolve_function(&self, _name: &str, _arg_count: usize) -> Result<Option<Func>> {
@@ -558,20 +600,34 @@ impl Dialect for ShoutingUpperDialect {
         "shouting"
     }
 
+    fn parse_internal(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        SqliteDialect.parse_internal(sql)
+    }
+
+    fn parse_internal_column_definition(
+        &self,
+        sql: &str,
+    ) -> turso_core::Result<turso_parser::ast::ColumnDefinition> {
+        SqliteDialect.parse_internal_column_definition(sql)
+    }
+
     fn parse(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
-        engine::parse(sql)
+        turso_core::Dialect::parse(&SqliteDialect, sql)
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-        turso_core::schema::BTreeTable::from_sql(sql, root_page)
+        turso_core::schema::BTreeTable::from_stored_sql(&SqliteDialect, sql, root_page, false)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<Stmt> {
-        engine::parse_table_sql_ast(sql)
+        turso_core::dialect::parse_table_sql_ast(&SqliteDialect, sql)
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-        engine::table_sql_for_replay(sql)
+        turso_core::dialect::table_sql_for_replay(&SqliteDialect, sql)
     }
 
     fn format_table_sql(
@@ -580,15 +636,15 @@ impl Dialect for ShoutingUpperDialect {
         tbl_name: &QualifiedName,
         body: &CreateTableBody,
     ) -> Result<String> {
-        engine::format_table_sql(tbl_name, body)
+        turso_core::dialect::format_table_sql(tbl_name, body)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
-        engine::register_builtin_catalog(schema, enable_custom_types)
+        schema.register_builtin_catalog(self, enable_custom_types)
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        engine::resolve_builtin_function(name, arg_count)
+        turso_core::dialect::resolve_builtin_function(name, arg_count)
     }
 
     fn call_scalar(
@@ -597,7 +653,7 @@ impl Dialect for ShoutingUpperDialect {
         func: &ScalarFunc,
         args: &[Register],
     ) -> Result<Value> {
-        let value = engine::call_builtin_scalar(context, func, args)?;
+        let value = turso_core::dialect::call_builtin_scalar(context, func, args)?;
         if !matches!(func, ScalarFunc::Upper) {
             return Ok(value);
         }
@@ -1005,33 +1061,50 @@ fn in_place_vacuum_replays_schema_with_source_dialect() {
 #[test]
 fn test_sql_is_create_virtual_table() {
     assert!(sql_is_create_virtual_table(
+        &SqliteDialect,
         "CREATE VIRTUAL TABLE x USING y;"
     ));
     assert!(sql_is_create_virtual_table(
+        &SqliteDialect,
         "create virtual table x using y"
     ));
     assert!(sql_is_create_virtual_table(
+        &SqliteDialect,
         "  \n\tCREATE  VIRTUAL TABLE x USING y"
     ));
     assert!(sql_is_create_virtual_table(
+        &SqliteDialect,
         "-- comment\nCREATE /* c */ VIRTUAL TABLE x USING y"
     ));
     assert!(sql_is_create_virtual_table(
+        &SqliteDialect,
         "CREATE VIRTUAL TABLE IF NOT EXISTS x USING y(a, b)"
     ));
     // Quoted identifiers must not confuse the classifier either way.
     assert!(sql_is_create_virtual_table(
+        &SqliteDialect,
         "CREATE VIRTUAL TABLE \"create table\" USING y"
     ));
     // Regular table whose SQL merely contains the text must not match.
     assert!(!sql_is_create_virtual_table(
+        &SqliteDialect,
         "CREATE TABLE t(x TEXT DEFAULT 'create virtual')"
     ));
     assert!(!sql_is_create_virtual_table(
+        &SqliteDialect,
         "CREATE TABLE \"create virtual\"(x)"
     ));
-    assert!(!sql_is_create_virtual_table("CREATE TABLE t(x)"));
-    assert!(!sql_is_create_virtual_table("CREATE VIRTUALX TABLE t(x)"));
-    assert!(!sql_is_create_virtual_table("CREATE VIRTUAL"));
-    assert!(!sql_is_create_virtual_table(""));
+    assert!(!sql_is_create_virtual_table(
+        &SqliteDialect,
+        "CREATE TABLE t(x)"
+    ));
+    assert!(!sql_is_create_virtual_table(
+        &SqliteDialect,
+        "CREATE VIRTUALX TABLE t(x)"
+    ));
+    assert!(!sql_is_create_virtual_table(
+        &SqliteDialect,
+        "CREATE VIRTUAL"
+    ));
+    assert!(!sql_is_create_virtual_table(&SqliteDialect, ""));
 }

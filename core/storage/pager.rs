@@ -81,6 +81,7 @@ impl HeaderRef {
         Ok(IOResult::Done(Self(page)))
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn borrow(&self) -> &DatabaseHeader {
         // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
         let content = self.0.get_contents();
@@ -1258,10 +1259,10 @@ enum CommitState {
 }
 
 #[derive(Debug, Default)]
-struct CheckpointState {
-    phase: CheckpointPhase,
+pub struct CheckpointState {
+    pub phase: CheckpointPhase,
     /// The checkpoint result, set after WAL checkpoint completes
-    result: Option<CheckpointResult>,
+    pub result: Option<CheckpointResult>,
     /// The checkpoint mode, used to determine if WAL truncation is needed
     mode: Option<CheckpointMode>,
     /// The checkpoint state machine should acquire the lock or use the one by caller
@@ -1269,7 +1270,7 @@ struct CheckpointState {
 }
 
 #[derive(Clone, Debug)]
-struct PendingCheckpointDbIdentityRead {
+pub struct PendingCheckpointDbIdentityRead {
     max_frame: u64,
     header_buf: Arc<Buffer>,
     bytes_read: Arc<AtomicUsize>,
@@ -1278,7 +1279,7 @@ struct PendingCheckpointDbIdentityRead {
 }
 
 #[derive(Clone, Debug, Default)]
-enum CheckpointPhase {
+pub enum CheckpointPhase {
     #[default]
     NotCheckpointing,
     Checkpoint {
@@ -1612,7 +1613,7 @@ pub struct Pager {
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
-    pub(crate) wal: Option<Arc<dyn Wal>>,
+    pub wal: Option<Arc<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
@@ -1641,8 +1642,8 @@ pub struct Pager {
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
-    checkpoint_state: RwLock<CheckpointState>,
-    syncing: Arc<AtomicBool>,
+    pub checkpoint_state: RwLock<CheckpointState>,
+    pub syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
@@ -1667,7 +1668,7 @@ pub struct Pager {
     header_ref_state: RwLock<HeaderRefState>,
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
-    pub(crate) io_ctx: RwLock<IOContext>,
+    pub io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
     /// Whether this pager holds an ephemeral table or index, whose file no
@@ -1685,7 +1686,7 @@ pub struct Pager {
     /// Record buffers retired by closed cursors, kept for the next cursor so
     /// each statement execution does not allocate and free a page-sized
     /// buffer per cursor.
-    record_pool: Mutex<Vec<crate::types::RecordBuf>>,
+    pub record_pool: Mutex<Vec<crate::types::RecordBuf>>,
     /// Heap allocations of closed b-tree cursors, kept for the next cursor so
     /// each statement execution does not allocate and free one per cursor.
     /// The boxes are the point: each one is a cursor-sized allocation.
@@ -3211,12 +3212,12 @@ impl Pager {
         PageSize::new(value).expect("invalid page size stored")
     }
 
-    pub(crate) fn has_wal(&self) -> bool {
+    pub fn has_wal(&self) -> bool {
         self.wal.is_some()
     }
 
-    #[cfg(test)]
-    pub(crate) fn wal_shared_ptr(&self) -> Option<usize> {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn wal_shared_ptr(&self) -> Option<usize> {
         self.wal
             .as_ref()
             .and_then(|wal| wal.as_any().downcast_ref::<crate::storage::wal::WalFile>())
@@ -6440,7 +6441,7 @@ impl CreateBTreeFlags {
 **               identifies the parent page in the btree.
 */
 #[cfg(feature = "autovacuum")]
-pub(crate) mod ptrmap {
+pub mod ptrmap {
     #[allow(unused_imports)]
     use crate::{storage::sqlite3_ondisk::PageSize, LimboError, Result};
     use crate::{turso_assert_greater_than_or_equal, turso_soft_unreachable};
@@ -6587,7 +6588,7 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use crate::security::roles::SessionRole;
+
     use crate::sync::Arc;
 
     use crate::sync::RwLock;
@@ -6603,34 +6604,6 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager, SharedPagerState,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
-
-    #[test]
-    fn record_pool_frees_buffers_of_rows_larger_than_a_page() {
-        let io = Arc::new(MemoryIO::new());
-        let db =
-            crate::Database::open_file(io, ":memory:", Arc::new(crate::EngineDialect)).unwrap();
-        let conn = db
-            .connect(crate::ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT NOT NULL, tag TEXT)")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (1, CAST(zeroblob(6 * 1024 * 1024) AS TEXT), 'big')")
-            .unwrap();
-        conn.execute("INSERT INTO t VALUES (2, CAST(zeroblob(5000) AS TEXT), 'small')")
-            .unwrap();
-        conn.execute("SELECT body FROM t WHERE id = 1").unwrap();
-        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 1")
-            .unwrap();
-        conn.execute("UPDATE t SET tag = 'updated' WHERE id = 2")
-            .unwrap();
-
-        let pager = conn.get_pager();
-        let pool = pager.record_pool.lock();
-        assert!(!pool.is_empty());
-        for buf in pool.iter() {
-            assert!(buf.capacity() <= super::PageSize::MAX as usize);
-        }
-    }
 
     #[test]
     fn checkpoint_reset_does_not_reuse_failed_header_read() {
@@ -7273,158 +7246,5 @@ mod ptrmap_tests {
             }
             IOResult::IO(_) => panic!("loaded cache hit must not yield"),
         }
-    }
-}
-
-#[cfg(all(test, feature = "fs", host_shared_wal))]
-mod checkpoint_phase_tests {
-    use super::*;
-    use crate::io::{PlatformIO, IO};
-    use crate::security::roles::SessionRole;
-    use crate::storage::sqlite3_ondisk::DatabaseHeader;
-    use crate::storage::wal::CheckpointMode;
-    use crate::sync::atomic::Ordering;
-    use crate::types::IOResult;
-    use crate::ConnectOpts;
-    use crate::Database;
-    use crate::EngineDialect;
-
-    /// Returns an IO backend that supports shared WAL coordination on the host.
-    /// On Windows the default `PlatformIO` (`WindowsIO`) lacks the byte-locking
-    /// and mapping primitives, so the experimental IOCP backend is used when
-    /// the `experimental_win_iocp` feature is enabled.
-    fn shared_wal_test_io() -> Arc<dyn IO> {
-        #[cfg(all(target_os = "windows", feature = "experimental_win_iocp"))]
-        {
-            Arc::new(crate::WindowsIOCP::new().unwrap())
-        }
-        #[cfg(not(all(target_os = "windows", feature = "experimental_win_iocp")))]
-        {
-            Arc::new(PlatformIO::new().unwrap())
-        }
-    }
-
-    /// The returned `TempDir` deletes the database directory when it drops, so
-    /// callers must hold it for as long as they use the database.
-    fn open_checkpoint_test_database() -> (Arc<Database>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        {
-            let connection = rusqlite::Connection::open(&db_path).unwrap();
-            connection
-                .pragma_update(None, "journal_mode", "wal")
-                .unwrap();
-        }
-        let io = shared_wal_test_io();
-        let db = Database::open_file_with_flags(
-            io,
-            db_path.to_str().unwrap(),
-            crate::OpenFlags::default(),
-            crate::DatabaseOpts::new().with_multiprocess_wal(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        (db, dir)
-    }
-
-    fn db_identity(db_path: &std::path::Path) -> (u32, u32) {
-        let bytes = std::fs::read(db_path).unwrap();
-        assert!(bytes.len() >= DatabaseHeader::SIZE);
-        let db_size_pages = u32::from_be_bytes(bytes[28..32].try_into().unwrap());
-        let crc = crc32c::crc32c(&bytes[..DatabaseHeader::SIZE]);
-        (db_size_pages, crc)
-    }
-
-    #[test]
-    fn checkpoint_db_sync_completion_still_leaves_backfill_unpublished_until_proof_install() {
-        let (db, dir) = open_checkpoint_test_database();
-        let db_path = dir.path().join("test.db");
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.wal_auto_actions_disable();
-        conn.execute("create table test(id integer primary key, value blob)")
-            .unwrap();
-        conn.execute("begin immediate").unwrap();
-        for _ in 0..32 {
-            conn.execute("insert into test(value) values (randomblob(2048))")
-                .unwrap();
-        }
-        conn.execute("commit").unwrap();
-        assert!(
-            db.shared_wal
-                .read()
-                .metadata
-                .max_frame
-                .load(Ordering::SeqCst)
-                > 1,
-            "checkpoint setup requires more than one WAL frame"
-        );
-
-        let pager = conn.pager.load();
-        let mode = CheckpointMode::Passive {
-            upper_bound_inclusive: Some(1),
-        };
-
-        loop {
-            match pager.checkpoint(mode, crate::SyncMode::Full, true).unwrap() {
-                IOResult::Done(_) => {
-                    panic!("checkpoint should not finish before we observe the post-sync gap")
-                }
-                IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
-            }
-
-            let state = pager.checkpoint_state.read();
-            let Some(result) = state.result.as_ref() else {
-                continue;
-            };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
-                && !pager.syncing.load(Ordering::SeqCst)
-            {
-                break;
-            }
-        }
-
-        let authority = db.shared_wal_coordination().unwrap().unwrap();
-        let snapshot_before_publish = authority.snapshot();
-        let (db_size_pages, db_header_crc32c) = db_identity(&db_path);
-        assert_eq!(
-            snapshot_before_publish.nbackfills, 0,
-            "DB sync completion alone must not publish positive nbackfills"
-        );
-        assert!(
-            !authority.validate_backfill_proof(
-                snapshot_before_publish,
-                db_size_pages,
-                db_header_crc32c
-            ),
-            "DB sync completion must still leave the durable backfill proof absent"
-        );
-
-        let result = pager
-            .io
-            .block(|| pager.checkpoint(mode, crate::SyncMode::Full, true))
-            .unwrap();
-        assert!(
-            result.wal_total_backfilled > 0 && !result.everything_backfilled(),
-            "resumed checkpoint should complete the partial checkpoint after proof installation"
-        );
-
-        let snapshot_after_publish = authority.snapshot();
-        let (db_size_pages_after, db_header_crc32c_after) = db_identity(&db_path);
-        assert!(
-            snapshot_after_publish.nbackfills > 0,
-            "proof installation step must publish positive nbackfills"
-        );
-        assert!(
-            authority.validate_backfill_proof(
-                snapshot_after_publish,
-                db_size_pages_after,
-                db_header_crc32c_after
-            ),
-            "resuming after the post-sync gap must install a valid durable backfill proof"
-        );
     }
 }

@@ -1448,8 +1448,13 @@ pub fn op_vcreate(
         vec![]
     };
     let conn = program.connection.clone();
-    let table =
-        crate::VirtualTable::table(Some(&table_name), &module_name, args, &conn.syms.read())?;
+    let table = crate::VirtualTable::table(
+        conn.dialect().as_ref(),
+        Some(&table_name),
+        &module_name,
+        args,
+        &conn.syms.read(),
+    )?;
     {
         conn.syms.write().vtabs.insert(table_name, table);
     }
@@ -10921,8 +10926,10 @@ pub fn op_function(
                         }
                     };
 
-                    let column_def =
-                        crate::dialect::engine::parse_column_definition(column_def, true)?;
+                    let column_def = program
+                        .connection
+                        .dialect()
+                        .parse_internal_column_definition(column_def)?;
 
                     let _rename_to = normalize_ident(column_def.col_name.as_str());
 
@@ -13961,7 +13968,9 @@ pub fn op_add_type(
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
     let syms = conn.syms.read();
-    conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql, &syms))??;
+    conn.with_database_schema_mut(*db, |schema| {
+        schema.add_type_from_sql(conn.dialect().as_ref(), sql, &syms)
+    })??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -14871,6 +14880,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
 
                 // The schema already holds every stored type.
                 let populate_result = schema.populate_types_views_then_indices(
+                    conn.dialect().as_ref(),
                     &syms,
                     &[],
                     materialized_view_info,
@@ -17010,6 +17020,7 @@ pub fn op_alter_column(
                 let mut rewrites = Vec::new();
                 for (view_name, view) in schema.views(*namespace) {
                     if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                        conn.dialect().as_ref(),
                         &view.sql,
                         schema,
                         *namespace,
@@ -17039,6 +17050,7 @@ pub fn op_alter_column(
                     let mut rewrites = Vec::new();
                     for (view_name, view) in schema.views(NamespaceId::ROOT) {
                         if let Some(rewritten) = rewrite_view_sql_for_column_rename(
+                            conn.dialect().as_ref(),
                             &view.sql,
                             schema,
                             NamespaceId::ROOT,
@@ -17227,7 +17239,13 @@ pub fn op_alter_column(
     if *rename {
         for (trigger_namespace, trigger_name, sql) in rewritten_triggers {
             conn.with_database_schema_mut(trigger_namespace.database_id, |schema| {
-                replace_trigger_sql(schema, trigger_namespace.id, trigger_name, sql)
+                replace_trigger_sql(
+                    conn.dialect().as_ref(),
+                    schema,
+                    trigger_namespace.id,
+                    trigger_name,
+                    sql,
+                )
             })??;
         }
 
@@ -17274,6 +17292,7 @@ pub fn op_alter_column(
 }
 
 fn replace_trigger_sql(
+    dialect: &dyn crate::dialect::Dialect,
     schema: &mut Schema,
     namespace: NamespaceId,
     trigger_name: &str,
@@ -17284,7 +17303,7 @@ fn replace_trigger_sql(
         when_clause,
         commands,
         ..
-    })) = crate::dialect::engine::parse_statement(sql)?
+    })) = crate::dialect::parse_statement(dialect, sql)?
     else {
         return Err(LimboError::ParseError(format!(
             "invalid trigger sql: {sql}"
@@ -19042,7 +19061,7 @@ pub(crate) enum VacuumIntoOpPhase {
 
 /// Holds the state for the VACUUM INTO opcode operation.
 #[derive(Default)]
-pub(crate) struct VacuumIntoOpContext {
+pub struct VacuumIntoOpContext {
     phase: VacuumIntoOpPhase,
     /// Database index for the source schema.
     source_db_id: usize,
@@ -19130,7 +19149,7 @@ pub(crate) fn cleanup_vacuum_state(
     }
 }
 
-fn cleanup_op_vacuum_into(
+pub fn cleanup_op_vacuum_into(
     connection: &Arc<Connection>,
     state: &mut ProgramState,
     mut vacuum_state: Box<VacuumIntoOpContext>,
@@ -19545,12 +19564,8 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::security::roles::SessionRole;
+
     use crate::translate::collate::CollationSeq;
-    use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-    use crate::vdbe::BranchOffset;
-    use crate::EngineDialect;
-    use crate::{ConnectOpts, Database, DatabaseOpts, MemoryIO, IO};
 
     /// A weighted step must leave the same exact total as the weighted sum
     /// computed in 128-bit arithmetic, including when the i64 part wraps.
@@ -19585,396 +19600,10 @@ mod tests {
     }
 
     #[test]
-    fn set_subtype_non_integer_returns_error() {
-        assert_set_subtype_error(Value::build_text("74"), "stored subtype must be an integer");
-    }
-
-    #[test]
-    fn set_subtype_unknown_integer_returns_error() {
-        assert_set_subtype_error(Value::from_i64(75), "unknown stored subtype: 75");
-    }
-
-    fn assert_set_subtype_error(subtype: Value, expected_message: &str) {
-        let (program, pager) = empty_program();
-        let mut state = ProgramState::new(2, 0);
-        let original = Value::build_text("unchanged");
-        state.set_register(0, Register::Value(subtype));
-        state.set_register(1, Register::Value(original.clone()));
-        let insn = Insn::SetSubtype {
-            subtype_reg: 0,
-            dest_reg: 1,
-        };
-        let err = match op_set_subtype(&program, &mut state, &insn, &pager) {
-            Ok(_) => panic!("invalid subtype must fail"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(*err, LimboError::InternalError(ref message) if message == expected_message),
-            "unexpected error: {err:?}"
-        );
-        assert_eq!(state.pc, 0);
-        assert_eq!(state.get_register(1).get_value(), &original);
-    }
-
-    fn empty_program() -> (Program, Arc<Pager>) {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let pager = conn.get_pager();
-        let builder =
-            ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(0, 0, 0));
-        let program = builder.build(conn, false, "").unwrap();
-        (program, pager)
-    }
-
-    fn make_spilled_hash_table() -> (HashTable, crate::alloc::Vec<Value>, usize) {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let config = HashTableConfig {
-            initial_buckets: 4,
-            mem_budget: 1024,
-            num_keys: 1,
-            collations: vec![CollationSeq::BINARY],
-            temp_store: crate::TempStore::Default,
-            track_matched: false,
-            ..Default::default()
-        };
-        let mut ht = HashTable::new(config, io).unwrap();
-
-        for i in 0..1024 {
-            match ht
-                .insert(vec![Value::from_i64(i)], i, vec![], None)
-                .unwrap()
-            {
-                IOResult::Done(()) => {}
-                IOResult::IO(_) => panic!("memory IO should complete synchronously"),
-            }
-        }
-
-        match ht.finalize_build(None).unwrap() {
-            IOResult::Done(()) => {}
-            IOResult::IO(_) => panic!("memory IO should complete synchronously"),
-        }
-        assert!(ht.has_spilled(), "test requires spilled hash table");
-
-        let probe_key = (0..1024)
-            .map(|i| vec![Value::from_i64(i)])
-            .find(|key| {
-                let partition_idx = ht.partition_for_keys(key).unwrap();
-                !ht.is_partition_loaded(partition_idx)
-            })
-            .expect("expected an unloaded spilled partition");
-        let partition_idx = ht.partition_for_keys(&probe_key).unwrap();
-
-        (ht, probe_key, partition_idx)
-    }
-
-    /// same like `test_vacuum_into_busy_after_source_begin_rolls_back_source_txn`
-    /// but for attached dbs
-    #[test]
-    fn test_cleanup_vacuum_into_rolls_back_attached_only_source_txn() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let main_path = dir.path().join("vacuum-into-cleanup-main.db");
-        let attached_path = dir.path().join("vacuum-into-cleanup-attached.db");
-
-        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            main_path.to_str().unwrap(),
-            OpenFlags::Create,
-            DatabaseOpts::new().with_attach(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-
-        conn.execute(format!(
-            "ATTACH DATABASE '{}' AS att",
-            attached_path.display()
-        ))
-        .unwrap();
-        conn.execute("CREATE TABLE att.t(x)").unwrap();
-        conn.execute("INSERT INTO att.t VALUES (1)").unwrap();
-
-        conn.execute("BEGIN").unwrap();
-        let attached_db_id = conn.get_database_id_by_name("att").unwrap();
-        let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
-        attached_pager.begin_read_tx().unwrap();
-
-        assert!(
-            !conn.pager.load().holds_read_lock(),
-            "attached-only cleanup regression requires the main pager to stay lock-free"
-        );
-        assert!(
-            attached_pager.holds_read_lock(),
-            "attached source pager should hold the pinned read snapshot"
-        );
-
-        let mut state = ProgramState::new(0, 0);
-        state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
-
-        cleanup_op_vacuum_into(&conn, &mut state, Box::default()).unwrap();
-
-        assert!(
-            conn.get_auto_commit(),
-            "cleanup should restore auto-commit without going through SQL ROLLBACK"
-        );
-        assert_eq!(state.auto_txn_cleanup, TxnCleanup::None);
-        assert!(
-            !attached_pager.holds_read_lock(),
-            "cleanup should release the attached source read snapshot"
-        );
-
-        conn.execute("INSERT INTO att.t VALUES (2)").unwrap();
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM att.t").unwrap();
-        let mut count = 0_i64;
-        stmt.run_with_row_callback(|row| {
-            count = row.get(0)?;
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn test_savepoint_loads_evicted_attached_header_before_mirroring() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            "savepoint-main.db",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_attach(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.execute("ATTACH 'savepoint-aux.db' AS aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x)").unwrap();
-
-        let attached_db_id = conn.get_database_id_by_name("aux").unwrap();
-        let attached_pager = conn.get_pager_from_database_index(&attached_db_id).unwrap();
-        attached_pager.begin_read_tx().unwrap();
-        attached_pager.clear_page_cache(false);
-
-        conn.execute("SAVEPOINT s").unwrap();
-        conn.execute("RELEASE s").unwrap();
-    }
-
-    #[test]
-    fn test_hash_probe_rejects_unloaded_spilled_partition_without_probe_rowid() {
-        let (program, pager) = empty_program();
-        let (ht, probe_key, _) = make_spilled_hash_table();
-
-        let mut state = ProgramState::new(2, 0);
-        state.hash_tables.insert(7, ht);
-        state.set_register(0, Register::Value(probe_key[0].clone()));
-
-        let insn = Insn::HashProbe {
-            hash_table_id: 7,
-            key_start_reg: 0,
-            num_keys: 1,
-            dest_reg: 1,
-            target_pc: BranchOffset::Offset(99),
-            deferred_target_pc: BranchOffset::Offset(98),
-            payload_dest_reg: None,
-            num_payload: 0,
-            probe_rowid_reg: None,
-        };
-
-        let err = match op_hash_probe(&program, &mut state, &insn, &pager) {
-            Ok(_) => {
-                panic!("HashProbe should reject grace-only probing without a loaded partition")
-            }
-            Err(err) => err,
-        };
-
-        assert!(
-            matches!(*err, LimboError::InternalError(ref message) if message.contains("probe_rowid_reg=None is grace-only")),
-            "unexpected error: {err:?}"
-        );
-        assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
-        assert!(
-            state.active_op_state.hash_probe().is_none(),
-            "HashProbe should not stash resumable state for the removed fallback path"
-        );
-    }
-
-    #[test]
-    fn test_hash_probe_allows_grace_style_probe_after_partition_preload() {
-        let (program, pager) = empty_program();
-        let (mut ht, probe_key, partition_idx) = make_spilled_hash_table();
-
-        loop {
-            match ht.load_spilled_partition(partition_idx, None).unwrap() {
-                IOResult::Done(()) => break,
-                IOResult::IO(_) => continue,
-            }
-        }
-        assert!(
-            ht.is_partition_loaded(partition_idx),
-            "grace-style probe requires the build partition to be resident"
-        );
-
-        let expected_rowid = match &probe_key[0] {
-            Value::Numeric(Numeric::Integer(i)) => *i,
-            ref other => panic!("expected integer probe key, got {other:?}"),
-        };
-
-        let mut state = ProgramState::new(2, 0);
-        state.hash_tables.insert(7, ht);
-        state.set_register(0, Register::Value(probe_key[0].clone()));
-
-        let insn = Insn::HashProbe {
-            hash_table_id: 7,
-            key_start_reg: 0,
-            num_keys: 1,
-            dest_reg: 1,
-            target_pc: BranchOffset::Offset(99),
-            deferred_target_pc: BranchOffset::Offset(98),
-            payload_dest_reg: None,
-            num_payload: 0,
-            probe_rowid_reg: None,
-        };
-
-        let step = op_hash_probe(&program, &mut state, &insn, &pager)
-            .expect("preloaded grace probe should succeed");
-        assert!(matches!(step, InsnFunctionStepResult::Step));
-        assert_eq!(state.pc, 1, "matching probe should fall through");
-        assert_eq!(
-            state.get_register(1).get_value(),
-            &Value::from_i64(expected_rowid),
-            "HashProbe should return the matching build rowid"
-        );
-    }
-
-    #[test]
-    fn test_decr_jump_zero_non_integer_register_returns_error() {
-        let (program, pager) = empty_program();
-
-        let mut state = ProgramState::new(1, 0);
-        state.set_register(0, Register::Value(Value::Text("not-an-int".into())));
-
-        let insn = Insn::DecrJumpZero {
-            reg: 0,
-            target_pc: crate::vdbe::BranchOffset::Offset(1),
-        };
-
-        let err = match op_decr_jump_zero(&program, &mut state, &insn, &pager) {
-            Ok(_) => panic!("non-integer register must fail"),
-            Err(err) => err,
-        };
-        assert!(matches!(*err, LimboError::Constraint(message) if message == "datatype mismatch"));
-        assert_eq!(state.pc, 0);
-    }
-
-    #[test]
-    fn test_make_record_overlapping_dest_returns_error() {
-        let (program, pager) = empty_program();
-
-        let mut state = ProgramState::new(3, 0);
-        for i in 0..3 {
-            state.set_register(i, Register::Value(Value::from_i64(i as i64)));
-        }
-        let insn = Insn::MakeRecord {
-            start_reg: 0,
-            count: 3,
-            dest_reg: 1,
-            index_name: None,
-            affinity_str: None,
-        };
-
-        let err = match op_make_record(&program, &mut state, &insn, &pager) {
-            Ok(_) => panic!("overlapping destination register must fail"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(*err, LimboError::InternalError(ref message) if message.contains("overlaps its source range")),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_sorter_data_unpaired_content_register_returns_error() {
-        let (program, pager) = empty_program();
-
-        // Pseudo cursor 1 exposes register 2, but SorterData targets register 3.
-        let mut state = ProgramState::new(4, 2);
-        state.cursors[1] = Some(Cursor::new_pseudo(crate::pseudo::PseudoCursor::new(2)));
-        let insn = Insn::SorterData {
-            cursor_id: 0,
-            dest_reg: 3,
-            pseudo_cursor: 1,
-        };
-
-        let err = match op_sorter_data(&program, &mut state, &insn, &pager) {
-            Ok(_) => panic!("unpaired content register must fail"),
-            Err(err) => err,
-        };
-        assert!(
-            matches!(*err, LimboError::InternalError(ref message) if message.contains("content register")),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
     fn test_execute_turso_version() {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
-    }
-
-    #[test]
-    fn if_null_row_does_nothing_for_unopened_cursor() {
-        let (program, pager) = empty_program();
-        let mut state = ProgramState::new(1, 1);
-        state.set_register(0, Register::Value(Value::from_i64(7)));
-        let insn = Insn::IfNullRow {
-            cursor_id: 0,
-            target_pc: BranchOffset::Offset(9),
-            dest: 0,
-        };
-
-        let step = op_if_null_row(&program, &mut state, &insn, &pager)
-            .expect("IfNullRow must accept an unopened cursor");
-
-        assert!(matches!(step, InsnFunctionStepResult::Step));
-        assert_eq!(state.pc, 1);
-        assert_eq!(state.get_register(0).get_value(), &Value::from_i64(7));
-    }
-
-    #[test]
-    fn if_null_row_clears_destination_and_jumps() {
-        let (program, pager) = empty_program();
-        let mut state = ProgramState::new(1, 1);
-        state.cursors[0] = Some(Cursor::NullRow);
-        state.set_register(0, Register::Value(Value::from_i64(7)));
-        let insn = Insn::IfNullRow {
-            cursor_id: 0,
-            target_pc: BranchOffset::Offset(9),
-            dest: 0,
-        };
-
-        let step = op_if_null_row(&program, &mut state, &insn, &pager)
-            .expect("IfNullRow must accept a null-row cursor");
-
-        assert!(matches!(step, InsnFunctionStepResult::Step));
-        assert_eq!(state.pc, 9);
-        assert_eq!(state.get_register(0).get_value(), &Value::Null);
     }
 
     #[test]

@@ -138,7 +138,7 @@ impl From<bool> for DoubleQuotedDml {
 }
 
 pub struct Resolver<'a> {
-    pub(crate) catalog: CatalogContext<'a>,
+    pub catalog: CatalogContext<'a>,
     pub expr_to_reg_cache_enabled: bool,
     /// Cache entries for previously translated expressions.
     /// The `needs_custom_type_decode` flag is true for hash-join payload registers
@@ -373,31 +373,10 @@ impl SelfTableScope {
     }
 }
 
-#[cfg(test)]
-impl Resolver<'static> {
-    /// A resolver over an empty main schema with the SQLite dialect. Its state is leaked so
-    /// that unit tests can create one in a single call.
-    pub(crate) fn empty_for_tests() -> Self {
-        Self::new(
-            Box::leak(Box::new(Schema::default())),
-            Box::leak(Box::new(RwLock::new(HashMap::default()))),
-            Box::leak(Box::new(RwLock::new(None))),
-            Box::leak(Box::new(RwLock::new(DatabaseCatalog::new()))),
-            Box::leak(Box::new(crate::Qualifiers::default())),
-            Box::leak(Box::new(SymbolTable::new())),
-            true,
-            DoubleQuotedDml::Enabled,
-            Arc::new(crate::EngineDialect),
-            None,
-            RoleId::SUPERUSER,
-        )
-    }
-}
-
 impl<'a> Resolver<'a> {
     /// Compiles `f` as for the superuser, so neither privileges nor
     /// row-level security limit anything, and then restores the role.
-    pub(crate) fn as_superuser<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+    pub fn as_superuser<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
         let role = std::mem::replace(&mut self.row_security_role, RoleId::SUPERUSER);
         let role_is_not_superuser = std::mem::replace(&mut self.role_is_not_superuser, false);
         let result = f(self);
@@ -407,7 +386,7 @@ impl<'a> Resolver<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         schema: &'a Schema,
         database_schemas: &'a RwLock<HashMap<usize, Arc<Schema>>>,
         temp_database: &'a RwLock<Option<crate::connection::TempDatabase>>,
@@ -941,7 +920,7 @@ impl LimitCtx {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct HashLabels {
+pub struct HashLabels {
     /// Label for hash join match processing (points to just after HashProbe instruction)
     /// Used by HashNext to jump back to process additional matches without re-probing
     pub match_found: BranchOffset,

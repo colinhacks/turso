@@ -254,12 +254,13 @@ use crate::storage::encryption::EncryptionContext;
 use crate::File;
 
 mod serializer;
+pub(crate) use serializer::log_write;
 use serializer::EncryptedPayload;
 #[cfg(feature = "conn_raw_api")]
 use serializer::{
     extension_record_len, ExtensionRecord, PortableChangePayload, PortableEndOffsetCtx,
 };
-pub(crate) use serializer::{log_write, LogBufferWrite, LogChunkStream, LogSerializer};
+pub use serializer::{LogBufferWrite, LogChunkStream, LogSerializer};
 #[cfg(feature = "conn_raw_api")]
 pub(crate) use serializer::{
     ProtoKey, ProtoSint64, ProtoVarint, PROTO_WIRE_LENGTH_DELIMITED, PROTO_WIRE_VARINT,
@@ -294,25 +295,25 @@ pub type OnSerializationComplete<'a> =
     Option<&'a dyn Fn(SharedBufferData, LogTxFrameInfo) -> crate::Result<()>>;
 
 const LOG_MAGIC: u32 = 0x4C4D4C32; // "LML2" in LE
-const LOG_VERSION_V2: u8 = 2;
-const LOG_VERSION: u8 = 3;
+pub const LOG_VERSION_V2: u8 = 2;
+pub const LOG_VERSION: u8 = 3;
 pub const LOG_HDR_SIZE: usize = 56;
 const LOG_HDR_SALT_START: usize = 8;
 const LOG_HDR_SALT_SIZE: usize = 8;
-const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
-const LOG_HDR_CRC_START: usize = 52;
+pub const LOG_HDR_RESERVED_START: usize = LOG_HDR_SALT_START + LOG_HDR_SALT_SIZE; // 16
+pub const LOG_HDR_CRC_START: usize = 52;
 const LOG_HDR_RESERVED_SIZE: usize = LOG_HDR_CRC_START - LOG_HDR_RESERVED_START; // 36
-pub(crate) const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
-pub(crate) const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
-const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
+pub const FRAME_MAGIC: u32 = 0x5854564D; // "MVTX" in LE
+pub const EXT_FRAME_MAGIC: u32 = 0x5845564D; // "MVEX" in LE
+pub const END_MAGIC: u32 = 0x4554564D; // "MVTE" in LE
 
 // Size of each chunk before encryption (i.e. before tag/nonce overhead is added)
-pub(crate) const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
+pub const ENCRYPTED_PAYLOAD_CHUNK_SIZE: usize = 32 * 1024;
 // Fixed AAD width for one encrypted chunk:
 // salt(8) + payload_size_or_zero(8) + op_count(4) + commit_ts(8) + chunk_index(4).
-const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
+pub const ENCRYPTED_CHUNK_AAD_SIZE: usize = 32;
 
-const OP_UPSERT_TABLE: u8 = 0;
+pub const OP_UPSERT_TABLE: u8 = 0;
 const OP_DELETE_TABLE: u8 = 1;
 const OP_UPSERT_INDEX: u8 = 2;
 const OP_DELETE_INDEX: u8 = 3;
@@ -340,24 +341,24 @@ impl Default for DeletePortableExtension {
     }
 }
 
-const TX_HEADER_SIZE_V2: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
-const TX_HEADER_SIZE: usize = TX_HEADER_SIZE_V2;
+pub const TX_HEADER_SIZE_V2: usize = 24; // FRAME_MAGIC(4) + payload_size(8) + op_count(4) + commit_ts(8)
+pub const TX_HEADER_SIZE: usize = TX_HEADER_SIZE_V2;
 // LML3 extension frames keep the recovery fields first, then append portable
 // metadata. Compact frames use the 24-byte recovery header and normal
 // FRAME_MAGIC; extension frames use EXT_FRAME_MAGIC and this 40-byte header.
-pub(crate) const TX_EXT_HEADER_SIZE: usize =
+pub const TX_EXT_HEADER_SIZE: usize =
     TX_HEADER_SIZE + 8 /* extension_size */ + 4 /* extension_record_count */ + 4 /* frame_flags */;
-const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
+pub const TX_TRAILER_SIZE: usize = 8; // crc32c(4) + END_MAGIC(4)
 const TX_MIN_FRAME_SIZE_V2: usize = TX_HEADER_SIZE_V2 + TX_TRAILER_SIZE; // 32
 const TX_MIN_FRAME_SIZE: usize = TX_HEADER_SIZE + TX_TRAILER_SIZE; // 32
 const TX_FRAME_FLAG_HAS_EXTENSION_BLOCK: u32 = 1 << 0;
-const EXTENSION_RECORD_HEADER_SIZE: usize = 8; // type(u16) + flags(u16) + len(u32)
-const EXTENSION_TYPE_PORTABLE_CHANGES: u16 = 1;
+pub const EXTENSION_RECORD_HEADER_SIZE: usize = 8; // type(u16) + flags(u16) + len(u32)
+pub const EXTENSION_TYPE_PORTABLE_CHANGES: u16 = 1;
 
 /// Total bytes pre-reserved at the front of a `LogRecord::buf`.
 pub(crate) const LOG_RECORD_PREFIX_SIZE: usize = LOG_HDR_SIZE + TX_HEADER_SIZE;
 
-fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
+pub fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usize {
     if payload_size == 0 {
         0
     } else {
@@ -369,7 +370,7 @@ fn encrypted_payload_chunk_count(payload_size: usize, chunk_size: usize) -> usiz
 /// If the payload fits within a chunk, then that is the length.
 /// If a payload spans over multiple chunks, then except the last chunk rest of the chunks
 /// will have `chunk_size` plaintext and the last one will have the remainder.
-fn encrypted_chunk_plaintext_len(
+pub fn encrypted_chunk_plaintext_len(
     payload_size: usize,
     chunk_index: usize,
     chunk_size: usize,
@@ -388,7 +389,7 @@ fn encrypted_chunk_plaintext_len(
 }
 
 /// On-disk size of one encrypted chunk: `plaintext_len + tag + nonce`.
-fn encrypted_chunk_blob_size(
+pub fn encrypted_chunk_blob_size(
     plaintext_len: usize,
     tag_size: usize,
     nonce_size: usize,
@@ -405,7 +406,7 @@ fn encrypted_chunk_blob_size(
 
 /// Total on-disk size of an encrypted payload: the sum of every chunk's
 /// `plaintext_len + tag + nonce`. The last chunk may be shorter than `chunk_size`.
-fn encrypted_payload_blob_size(
+pub fn encrypted_payload_blob_size(
     payload_size: usize,
     chunk_size: usize,
     tag_size: usize,
@@ -428,7 +429,7 @@ fn encrypted_payload_blob_size(
         .ok_or_else(|| LimboError::Corrupt("encrypted payload total size overflow".to_string()))
 }
 
-fn build_encrypted_chunk_aad(
+pub fn build_encrypted_chunk_aad(
     salt: u64,
     payload_size_in_aad: Option<u64>,
     op_count: u32,
@@ -573,7 +574,7 @@ impl LogHeader {
 
 /// Derives the initial CRC seed from the header salt.
 /// The salt is mixed into a 32-bit CRC state that seeds the first frame's checksum.
-fn derive_initial_crc(salt: u64) -> u32 {
+pub fn derive_initial_crc(salt: u64) -> u32 {
     crc32c::crc32c(&salt.to_le_bytes())
 }
 
@@ -1876,8 +1877,8 @@ impl StreamingLogicalLogReader {
         self.last_valid_offset = LOG_HDR_SIZE;
     }
 
-    #[cfg(test)]
-    pub(crate) fn next_frame_blocking(
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn next_frame_blocking(
         &mut self,
         io: &Arc<dyn crate::IO>,
     ) -> Result<Option<Vec<ParsedOp>>> {
@@ -3758,7 +3759,7 @@ enum EncryptedChunkReadResult {
 }
 
 #[cfg_attr(test, derive(Debug))]
-enum ParseResult {
+pub enum ParseResult {
     /// A fully validated transaction frame was parsed.
     Frame(ParsedFrame),
     /// True end-of-file: not enough bytes remain to form a complete frame.
@@ -3781,7 +3782,7 @@ pub struct ParsedFrame {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub(crate) enum ParsedOp {
+pub enum ParsedOp {
     UpsertTable {
         table_id: MVTableId,
         rowid: RowID,

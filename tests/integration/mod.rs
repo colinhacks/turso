@@ -12,21 +12,26 @@ mod checkpoint_stale_page_size;
 mod common;
 mod conflict_resolution;
 mod connection;
+mod connection_internals;
 mod custom_types;
 mod database;
 mod database_leak;
 mod database_open;
+mod database_registry;
 mod dialect;
 mod expr_depth_stack_overflow;
 mod external_apis;
 mod functions;
 mod fuzz_transaction;
+mod incremental;
 mod incremental_view;
 mod index_method;
 mod integrity_check;
 mod lossy_index_keys;
 #[cfg(feature = "io_memory_yield")]
 mod memory_yield;
+#[cfg(feature = "io_memory_yield")]
+mod memory_yield_internals;
 #[cfg(all(
     feature = "fs",
     any(unix, target_os = "windows"),
@@ -34,16 +39,26 @@ mod memory_yield;
     any(not(target_os = "windows"), feature = "win_iocp")
 ))]
 mod multiprocess;
+#[cfg(all(
+    feature = "fs",
+    any(unix, target_os = "windows"),
+    target_pointer_width = "64",
+    any(not(target_os = "windows"), feature = "win_iocp")
+))]
+mod multiprocess_wal;
 mod mvcc;
 mod native_extension;
 mod pragma;
+mod pragma_virtual_table;
 mod query_processing;
 mod query_timeout;
 mod queued_io;
 mod reindex;
 mod schema;
+mod schema_internals;
 mod security;
 mod statement;
+mod statement_internals;
 mod statement_lifecycle;
 mod statement_metadata;
 mod statement_reset;
@@ -57,7 +72,10 @@ mod transaction_errors;
 mod trigger;
 mod unreliable_io;
 mod views;
+mod virtual_table;
 mod wal;
+#[cfg(target_os = "windows")]
+mod windows_lock;
 
 #[cfg(test)]
 mod tests {

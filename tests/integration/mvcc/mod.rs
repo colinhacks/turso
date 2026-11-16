@@ -1,11 +1,15 @@
 mod checkpoint;
+mod checkpoint_internals;
 mod concurrent_inserts;
 mod database;
 mod group_commit;
+mod group_commit_batches;
+mod group_commit_sync_mode;
 mod hermitage;
 mod logical_log;
 mod persistence;
 mod store;
+pub(crate) mod store_internals;
 mod test_db;
 mod transactions;
 

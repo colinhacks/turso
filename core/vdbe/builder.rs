@@ -2648,7 +2648,7 @@ impl ProgramBuilder {
     }
 }
 
-pub(crate) trait CursorTypeExt {
+pub trait CursorTypeExt {
     fn accepts_column_range_fusing(&self) -> bool;
 }
 

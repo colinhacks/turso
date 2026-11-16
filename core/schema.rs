@@ -177,15 +177,15 @@ struct SequenceBackingTableSource {
     num_columns: usize,
 }
 
-struct SequenceMetadata {
+pub struct SequenceMetadata {
     // is_called intentionally omitted from descriptor reconstruction —
     // the runtime watermark (including is_called) is always read from
     // the backing-table row at nextval time, not seeded from schema.
-    start: i64,
-    increment: i64,
-    min: i64,
-    max: i64,
-    cycle: bool,
+    pub start: i64,
+    pub increment: i64,
+    pub min: i64,
+    pub max: i64,
+    pub cycle: bool,
 }
 
 use crate::util::quote_identifier as quote_ident;
@@ -650,7 +650,7 @@ impl TypeDef {
     }
 
     /// The kind of value the type reads as. STRUCT and UNION values are blobs.
-    pub(crate) fn value_type(&self) -> BuiltinType {
+    pub fn value_type(&self) -> BuiltinType {
         self.kinds().read
     }
 
@@ -1352,14 +1352,14 @@ pub struct NamespaceSchema {
     has_indexes: HashSet<String>,
 
     /// Mapping from table names to the materialized views that depend on them
-    table_to_materialized_views: HashMap<String, Vec<String>>,
+    pub table_to_materialized_views: HashMap<String, Vec<String>>,
 
     /// Track views that exist but have incompatible versions
-    incompatible_views: HashSet<String>,
+    pub incompatible_views: HashSet<String>,
     /// Main btree roots for incompatible materialized views. Their logical
     /// descriptors cannot be loaded, but DROP VIEW must still destroy their
     /// storage so the documented recreate path remains possible.
-    incompatible_materialized_view_roots: HashMap<String, i64>,
+    pub incompatible_materialized_view_roots: HashMap<String, i64>,
 
     /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
     /// older versions wrote view column lists without identifier quoting).
@@ -1382,12 +1382,6 @@ impl NamespaceSchema {
             || !self.sequences.is_empty()
             || !self.incompatible_views.is_empty()
             || !self.broken_views.is_empty()
-    }
-}
-
-impl Default for Schema {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1434,7 +1428,10 @@ pub enum TypeOrigin {
     User,
 }
 
-fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
+fn bootstrap_builtin_types(
+    dialect: &dyn crate::dialect::Dialect,
+    registry: &mut HashMap<String, Arc<TypeDef>>,
+) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
 
     // Whether values of the type take a COLLATE. In PostgreSQL only text
@@ -1475,7 +1472,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
     for &(accepts_collate, range_offsets, sql) in types {
         let Ok(Some(Cmd::Stmt(Stmt::CreateType {
             type_name, body, ..
-        }))) = crate::dialect::engine::parse_statement(sql)
+        }))) = crate::dialect::parse_statement(dialect, sql)
         else {
             return Err(crate::LimboError::InternalError(format!(
                 "failed to parse built-in type SQL: {sql}"
@@ -1521,16 +1518,6 @@ impl Schema {
         }
     }
 
-    /// Create a schema with custom types enabled.
-    ///
-    /// Panics if a hardcoded built-in type definition is malformed (programmer
-    /// bug). Production code that opens user databases should prefer
-    /// [`Schema::with_options`] which returns `Result`.
-    pub fn new() -> Self {
-        Self::with_options(true, &crate::dialect::EngineDialect)
-            .expect("built-in type definitions are malformed")
-    }
-
     pub fn with_options(
         enable_custom_types: bool,
         dialect: &dyn crate::dialect::Dialect,
@@ -1547,7 +1534,7 @@ impl Schema {
         table_names_by_root_page.insert(1, SCHEMA_TABLE_NAME.to_string());
         let mut type_registry = HashMap::default();
         if enable_custom_types {
-            bootstrap_builtin_types(&mut type_registry)?;
+            bootstrap_builtin_types(dialect, &mut type_registry)?;
         }
         let mut namespaces = HashMap::default();
         namespaces.insert(NamespaceId::ROOT, root);
@@ -1652,7 +1639,11 @@ impl Schema {
     /// namespaces table, and builds the materialized views that waited for
     /// them. A database without a namespaces table has the default
     /// namespaces. A schema that does not support namespaces has none.
-    pub fn load_namespace_names(&mut self, rows: &[(i64, String)]) -> Result<()> {
+    pub fn load_namespace_names(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        rows: &[(i64, String)],
+    ) -> Result<()> {
         if !self.supports_namespaces {
             return Ok(());
         }
@@ -1677,6 +1668,7 @@ impl Schema {
         self.namespace_names_loaded = true;
         if let Some(pending) = self.pending_materialized_views.take() {
             self.populate_materialized_views(
+                dialect,
                 pending.materialized_view_info,
                 pending.dbsp_state_roots,
                 pending.dbsp_state_index_roots,
@@ -2129,6 +2121,62 @@ impl Schema {
             .insert(name, sequence);
     }
 
+    /// Insert the standard SQLite-style catalog tables.
+    ///
+    /// `pragma_*` virtual tables use the dedicated `crate::vtab::VirtualTableType::Pragma`
+    /// variant (they aren't `InternalVirtualTable`), so they are inserted
+    /// directly. The rest go through [`Schema::register_internal_vtab`] — the
+    /// same path external callers use via [`crate::Database::register_internal_vtab`].
+    pub fn register_builtin_catalog(
+        &mut self,
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        enable_custom_types: bool,
+    ) -> crate::Result<()> {
+        for vtab in Self::pragma_vtabs(dialect) {
+            self.insert_table(
+                NamespaceId::ROOT,
+                vtab.name.to_owned(),
+                Arc::new(Table::Virtual(Arc::new((*vtab).clone()))),
+            );
+        }
+
+        #[cfg(feature = "json")]
+        {
+            self.register_internal_vtab(dialect, crate::json::vtab::JsonVirtualTable::json_each())?;
+            self.register_internal_vtab(dialect, crate::json::vtab::JsonVirtualTable::json_tree())?;
+        }
+        #[cfg(feature = "cli_only")]
+        {
+            self.register_internal_vtab(dialect, crate::dbpage::DbPageTable::new())?;
+            self.register_internal_vtab(dialect, crate::btree_dump::BtreeDumpTable::new())?;
+        }
+        if enable_custom_types {
+            self.register_internal_vtab(dialect, crate::turso_types_vtab::TursoTypesTable::new())?;
+        }
+        Ok(())
+    }
+
+    /// Build a `VirtualTable` for each PRAGMA table-valued function.
+    fn pragma_vtabs(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+    ) -> Vec<Arc<crate::vtab::VirtualTable>> {
+        crate::pragma::PragmaVirtualTable::functions()
+            .into_iter()
+            .map(|(tab, schema_sql)| {
+                Arc::new(crate::vtab::VirtualTable {
+                    name: format!("pragma_{}", tab.pragma_name),
+                    columns: crate::vtab::VirtualTable::resolve_columns(dialect, schema_sql)
+                        .expect("pragma table-valued function schema resolution should not fail"),
+                    kind: turso_ext::VTabKind::TableValuedFunction,
+                    vtab_type: crate::vtab::VirtualTableType::Pragma(tab),
+                    vtab_id: 0,
+                    is_droppable: false,
+                    innocuous: true,
+                })
+            })
+            .collect()
+    }
+
     /// Add an `InternalVirtualTable` to the schema's catalog. The wrapped
     /// table appears under the name returned by its `name()` method and is
     /// queryable like any other table. Returns the name actually inserted.
@@ -2136,12 +2184,16 @@ impl Schema {
     /// Intended for callers that want to surface state as a queryable table
     /// without going through `CREATE VIRTUAL TABLE` — for example, extensions
     /// that contribute metadata tables or alternative-dialect catalogs.
-    pub fn register_internal_vtab<T>(&mut self, table: T) -> crate::Result<String>
+    pub fn register_internal_vtab<T>(
+        &mut self,
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
+        table: T,
+    ) -> crate::Result<String>
     where
         T: crate::vtab::InternalVirtualTable + 'static,
     {
         let objects = self.namespace_mut(NamespaceId::ROOT);
-        let vtab = crate::vtab::VirtualTable::wrap_internal_table(table)?;
+        let vtab = crate::vtab::VirtualTable::wrap_internal_table(dialect, table)?;
         let name = vtab.name.clone();
         let lookup_name = normalize_ident(&name);
         objects.tables.insert(
@@ -2417,17 +2469,26 @@ impl Schema {
 
     /// Parse a CREATE TYPE SQL string and add the type to the in-memory
     /// registry. `syms` has the functions its DECODE may call.
-    pub fn add_type_from_sql(&mut self, sql: &str, syms: &SymbolTable) -> crate::Result<()> {
-        self.insert_type_from_sql(sql)?;
+    pub fn add_type_from_sql(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        sql: &str,
+        syms: &SymbolTable,
+    ) -> crate::Result<()> {
+        self.insert_type_from_sql(dialect, sql)?;
         self.update_value_types(syms)
     }
 
     /// Parse a CREATE TYPE or CREATE DOMAIN SQL string and add the type to the
     /// in-memory registry without working out the kind its DECODE gives.
-    fn insert_type_from_sql(&mut self, sql: &str) -> crate::Result<()> {
+    pub fn insert_type_from_sql(
+        &mut self,
+        dialect: &dyn crate::dialect::Dialect,
+        sql: &str,
+    ) -> crate::Result<()> {
         use turso_parser::ast::{Cmd, Stmt};
 
-        let cmd = crate::dialect::engine::parse_statement(sql);
+        let cmd = crate::dialect::parse_statement(dialect, sql);
         match cmd {
             Ok(Some(Cmd::Stmt(Stmt::CreateType {
                 type_name, body, ..
@@ -2541,11 +2602,12 @@ impl Schema {
     /// type affinities on all STRICT tables.
     fn load_type_definitions(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         type_sqls: &[String],
         syms: &SymbolTable,
     ) -> crate::Result<()> {
         for sql in type_sqls {
-            self.insert_type_from_sql(sql).map_err(|e| {
+            self.insert_type_from_sql(dialect, sql).map_err(|e| {
                 crate::LimboError::Corrupt(format!("malformed database schema - {e}"))
             })?;
         }
@@ -2655,11 +2717,7 @@ impl Schema {
 
     /// True when a metadata marker or operator table for this view exists
     /// under a different storage version than the current one.
-    pub(crate) fn dbsp_storage_version_mismatch(
-        &self,
-        namespace: NamespaceId,
-        view_name: &str,
-    ) -> bool {
+    pub fn dbsp_storage_version_mismatch(&self, namespace: NamespaceId, view_name: &str) -> bool {
         let objects = self.namespace(namespace);
         let view_name = normalize_ident(view_name);
         objects.tables.keys().any(|table_name| {
@@ -3616,6 +3674,7 @@ impl Schema {
                         .expect("accumulators must be initialized in Init phase");
                     let type_sqls = std::mem::replace(&mut state.type_sqls, vec![]);
                     self.populate_types_views_then_indices(
+                        dialect,
                         syms,
                         &type_sqls,
                         acc.materialized_view_info,
@@ -3653,6 +3712,7 @@ impl Schema {
     /// automatic_indices: indices created automatically for primary key and unique constraints
     pub fn populate_indices(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         syms: &SymbolTable,
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
@@ -3669,6 +3729,7 @@ impl Schema {
                 ))
             })?;
             let mut index = Index::from_sql(
+                dialect,
                 syms,
                 &unparsed_sql_from_index.sql,
                 unparsed_sql_from_index.root_page,
@@ -3804,8 +3865,9 @@ impl Schema {
         Ok(())
     }
 
-    fn order_persisted_materialized_views(
+    pub fn order_persisted_materialized_views(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         view_info: HashMap<String, StoredMaterializedView>,
     ) -> Result<Vec<(String, StoredMaterializedView)>> {
         let mut view_info = view_info;
@@ -3817,7 +3879,7 @@ impl Schema {
         let mut dependents: HashMap<String, Vec<String>> = HashMap::default();
 
         for (view_key, (namespace, sql, _)) in &view_info {
-            let cmd = crate::dialect::engine::parse_statement(sql)?.ok_or_else(|| {
+            let cmd = crate::dialect::parse_statement(dialect, sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_key} has an empty schema definition"
                 ))
@@ -3894,12 +3956,13 @@ impl Schema {
     /// keys, with the namespace, SQL text and root page of each.
     pub fn populate_materialized_views(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         materialized_view_info: HashMap<String, StoredMaterializedView>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
         for (view_key, (namespace, sql, main_root)) in
-            self.order_persisted_materialized_views(materialized_view_info)?
+            self.order_persisted_materialized_views(dialect, materialized_view_info)?
         {
             let view_name = self.demangle_name(&view_key).1.to_string();
             // The marker is mandatory even when the circuit has no stateful
@@ -3952,7 +4015,7 @@ impl Schema {
                 }
             }
 
-            let cmd = crate::dialect::engine::parse_statement(&sql)?.ok_or_else(|| {
+            let cmd = crate::dialect::parse_statement(dialect, &sql)?.ok_or_else(|| {
                 LimboError::Corrupt(format!(
                     "materialized view {view_name} has an empty schema definition"
                 ))
@@ -4002,7 +4065,8 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(&sql, self, main_root, namespace)?;
+            let incremental_view =
+                IncrementalView::from_sql(dialect, &sql, self, main_root, namespace)?;
 
             // Create a BTreeTable for the materialized view
             let cols = incremental_view.column_schema.flat_columns()?;
@@ -4129,6 +4193,7 @@ impl Schema {
     #[allow(clippy::too_many_arguments)]
     pub fn populate_types_views_then_indices(
         &mut self,
+        dialect: &dyn crate::dialect::Dialect,
         syms: &SymbolTable,
         type_sqls: &[String],
         materialized_view_info: HashMap<String, StoredMaterializedView>,
@@ -4142,7 +4207,7 @@ impl Schema {
             self.refuse_custom_types()?;
         }
         if !type_sqls.is_empty() {
-            self.load_type_definitions(type_sqls, syms)?;
+            self.load_type_definitions(dialect, type_sqls, syms)?;
         }
         if !self.namespace_names_loaded && !materialized_view_info.is_empty() {
             // A view body names tables by their namespace, so the views wait
@@ -4158,14 +4223,27 @@ impl Schema {
             pending
                 .dbsp_state_index_roots
                 .extend(dbsp_state_index_roots);
-            return self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled);
+            return self.populate_indices(
+                dialect,
+                syms,
+                from_sql_indexes,
+                automatic_indices,
+                mvcc_enabled,
+            );
         }
         self.populate_materialized_views(
+            dialect,
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
         )?;
-        self.populate_indices(syms, from_sql_indexes, automatic_indices, mvcc_enabled)
+        self.populate_indices(
+            dialect,
+            syms,
+            from_sql_indexes,
+            automatic_indices,
+            mvcc_enabled,
+        )
     }
 
     /// Refuse a schema that uses custom types when they are not enabled.
@@ -4250,7 +4328,7 @@ impl Schema {
         })
     }
 
-    fn install_sequence_descriptor(
+    pub fn install_sequence_descriptor(
         &mut self,
         sequence_name: &str,
         metadata: SequenceMetadata,
@@ -4314,7 +4392,7 @@ impl Schema {
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
-                    let create_vtab = match crate::dialect::engine::parse_statement(sql)? {
+                    let create_vtab = match crate::dialect::parse_statement(dialect, sql)? {
                         Some(Cmd::Stmt(Stmt::CreateVirtualTable(create_vtab))) => create_vtab,
                         other => {
                             return Err(LimboError::Corrupt(format!(
@@ -4337,6 +4415,7 @@ impl Schema {
                             .map(crate::Value::from_text)
                             .collect();
                         crate::VirtualTable::table(
+                            dialect,
                             Some(name),
                             create_vtab.module_name.as_str(),
                             args,
@@ -4479,7 +4558,7 @@ impl Schema {
                 }
 
                 // Parse the SQL to determine if it's a regular or materialized view
-                let parsed = crate::dialect::engine::parse_statement(sql);
+                let parsed = crate::dialect::parse_statement(dialect, sql);
                 if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
                     // Tolerate view rows whose stored SQL no longer parses
                     // (e.g. older versions wrote view column lists without
@@ -4545,7 +4624,7 @@ impl Schema {
                     for_each_row,
                     when_clause,
                     commands,
-                }))) = crate::dialect::engine::parse_statement(sql)
+                }))) = crate::dialect::parse_statement(dialect, sql)
                 else {
                     return Err(crate::LimboError::ParseError(format!(
                         "invalid trigger sql: {sql}"
@@ -4921,7 +5000,7 @@ impl Schema {
 
     /// The objects of namespace `id`, to change. The namespace must exist:
     /// the root always does, and any other id comes from this schema.
-    fn namespace_mut(&mut self, id: NamespaceId) -> &mut NamespaceSchema {
+    pub fn namespace_mut(&mut self, id: NamespaceId) -> &mut NamespaceSchema {
         self.namespaces
             .get_mut(&id)
             .expect("the schema has the namespace whose objects are changed")
@@ -5552,11 +5631,11 @@ bitflags! {
 }
 
 #[derive(Debug)]
-pub(crate) struct GeneratedColGraph {
+pub struct GeneratedColGraph {
     /// `dependencies[j]` = columns `j` transitively reads from (excludes `j`).
-    dependencies: Vec<ColumnMask>,
+    pub dependencies: Vec<ColumnMask>,
     /// `dependents[i]` = columns that transitively read from `i` (excludes `i`).
-    dependents: Vec<ColumnMask>,
+    pub dependents: Vec<ColumnMask>,
     /// All column indices, built by passes over the table in column order, each
     /// pass taking every column whose inputs are already taken.
     topological_sort: Vec<usize>,
@@ -6027,21 +6106,16 @@ impl BTreeTable {
         })
     }
 
-    /// Builds a table from the SQLite text of its `CREATE TABLE`, as a
-    /// database that does not support namespaces holds it.
-    pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
-        Self::from_stored_sql(sql, root_page, false)
-    }
-
-    /// Builds a table from the SQLite text of its `CREATE TABLE`.
-    /// `supports_namespaces` says whether the database supports namespaces, so
+    /// Builds a table from the SQLite text of its `CREATE TABLE`, which
+    /// `dialect` parses. `supports_namespaces` says whether the database supports namespaces, so
     /// that a foreign key may name the mangled name of a table of one.
     pub fn from_stored_sql(
+        dialect: &(impl crate::dialect::Dialect + ?Sized),
         sql: &str,
         root_page: i64,
         supports_namespaces: bool,
     ) -> Result<BTreeTable> {
-        let cmd = crate::dialect::engine::parse_statement(sql)?;
+        let cmd = crate::dialect::parse_statement(dialect, sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
                 Self::from_create_table_ast(&tbl_name, &body, root_page, supports_namespaces)
@@ -6483,7 +6557,7 @@ impl BTreeTable {
         Ok(())
     }
 
-    fn column_graph(&self) -> Result<&GeneratedColGraph> {
+    pub fn column_graph(&self) -> Result<&GeneratedColGraph> {
         if let Some(graph) = self.column_dependencies.0.get() {
             return Ok(graph);
         }
@@ -6508,12 +6582,12 @@ impl BTreeTable {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn peek_column_dependencies(&self) -> Option<&GeneratedColGraph> {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn peek_column_dependencies(&self) -> Option<&GeneratedColGraph> {
         self.column_dependencies.0.get()
     }
 
-    pub(crate) fn columns_affected_by_update(
+    pub fn columns_affected_by_update(
         &self,
         updated_cols: impl IntoIterator<Item = usize>,
     ) -> Result<ColumnMask> {
@@ -6529,7 +6603,7 @@ impl BTreeTable {
         Ok(affected)
     }
 
-    pub(crate) fn dependencies_of_columns(
+    pub fn dependencies_of_columns(
         &self,
         targets: impl IntoIterator<Item = usize>,
     ) -> Result<ColumnMask> {
@@ -8772,13 +8846,14 @@ impl IndexColumn {
 
 impl Index {
     pub fn from_sql(
+        dialect: &dyn crate::dialect::Dialect,
         syms: &SymbolTable,
         sql: &str,
         root_page: i64,
         table: &BTreeTable,
         schema: &Schema,
     ) -> Result<Index> {
-        let cmd = crate::dialect::engine::parse_statement(sql)?;
+        let cmd = crate::dialect::parse_statement(dialect, sql)?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateIndex {
                 idx_name,
@@ -8809,7 +8884,7 @@ impl Index {
                         columns: index_columns.try_clone()?,
                         parameters,
                     };
-                    let descriptor = module.attach(&configuration)?;
+                    let descriptor = module.attach(dialect, &configuration)?;
                     Ok(Index {
                         name: index_name,
                         table_name: normalize_ident(tbl_name.as_str()),
@@ -9154,174 +9229,6 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::roles::SessionRole;
-
-    #[test]
-    fn builtin_types_read_as_the_kind_their_decode_gives() {
-        use crate::{
-            translate::expr::expr_type::value_type, ConnectOpts, Database, DatabaseOpts,
-            EngineDialect, MemoryIO, OpenFlags, IO, MAIN_DB_ID,
-        };
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file_with_flags(
-            io,
-            ":memory:",
-            OpenFlags::Create,
-            DatabaseOpts::new().with_custom_types(true),
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        let syms = conn.syms.read();
-        conn.with_schema(MAIN_DB_ID, |schema| {
-            assert!(schema.type_registry.values().all(|t| t.is_builtin));
-            for (name, type_def) in &schema.type_registry {
-                assert_eq!(
-                    Some(type_def.value_type()),
-                    value_type(type_def, schema, &syms),
-                    "built-in type {name}"
-                );
-            }
-        });
-    }
-
-    #[test]
-    #[should_panic(expected = "kinds of type price were read before they were worked out")]
-    fn reading_the_kind_of_a_type_not_yet_worked_out_panics() {
-        let mut schema = Schema::new();
-        schema
-            .insert_type_from_sql(
-                "CREATE TYPE price(value any) BASE text ENCODE value DECODE CAST(value AS real)",
-            )
-            .unwrap();
-        schema.get_type_def_unchecked("price").unwrap().value_type();
-    }
-
-    #[test]
-    fn persisted_materialized_views_are_loaded_in_dependency_order() {
-        let mut views = HashMap::default();
-        views.insert(
-            "third".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW third AS SELECT * FROM second".to_string(),
-                5,
-            ),
-        );
-        views.insert(
-            "first".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW first AS SELECT * FROM base".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "second".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW second AS SELECT * FROM first".to_string(),
-                4,
-            ),
-        );
-
-        let ordered = Schema::new()
-            .order_persisted_materialized_views(views)
-            .unwrap();
-        assert_eq!(
-            ordered
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect::<std::vec::Vec<_>>(),
-            vec!["first", "second", "third"]
-        );
-    }
-
-    #[test]
-    fn persisted_materialized_view_cycle_is_corrupt() {
-        let mut views = HashMap::default();
-        views.insert(
-            "left_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW left_view AS SELECT * FROM right_view".to_string(),
-                3,
-            ),
-        );
-        views.insert(
-            "right_view".to_string(),
-            (
-                NamespaceId::ROOT,
-                "CREATE MATERIALIZED VIEW right_view AS SELECT * FROM left_view".to_string(),
-                4,
-            ),
-        );
-
-        let error = Schema::new()
-            .order_persisted_materialized_views(views)
-            .unwrap_err();
-        assert!(matches!(error, LimboError::Corrupt(_)));
-    }
-
-    #[test]
-    fn incompatible_materialized_view_can_be_removed() {
-        let mut schema = Schema::new();
-        let root = schema.namespace_mut(NamespaceId::ROOT);
-        root.incompatible_views.insert("old_view".to_string());
-        root.incompatible_materialized_view_roots
-            .insert("old_view".to_string(), 42);
-        root.table_to_materialized_views
-            .insert("base".to_string(), vec!["old_view".to_string()]);
-
-        assert!(schema.materialized_view_exists(NamespaceId::ROOT, "old_view"));
-        assert_eq!(
-            schema.incompatible_materialized_view_root(NamespaceId::ROOT, "old_view"),
-            Some(42)
-        );
-        schema.remove_view(NamespaceId::ROOT, "old_view").unwrap();
-        assert!(!schema.materialized_view_exists(NamespaceId::ROOT, "old_view"));
-        assert!(!schema.is_incompatible_view(NamespaceId::ROOT, "old_view"));
-        assert!(schema
-            .get_dependent_materialized_views(NamespaceId::ROOT, "base")
-            .is_empty());
-    }
-
-    #[test]
-    fn stateless_materialized_view_requires_current_version_marker() -> Result<()> {
-        fn add_marker(schema: &mut Schema, name: &str, root_page: i64) -> Result<()> {
-            let sql = format!(
-                "CREATE TABLE {} (version INTEGER)",
-                crate::util::quote_identifier(name)
-            );
-            schema.add_btree_table(
-                NamespaceId::ROOT,
-                Arc::new(BTreeTable::from_sql(&sql, root_page)?),
-            )
-        }
-
-        let mut schema = Schema::new();
-        assert!(!schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
-
-        let old_version = DBSP_CIRCUIT_VERSION - 1;
-        let other_view_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless__n1");
-        add_marker(&mut schema, &other_view_marker, 2)?;
-        assert!(
-            !schema.dbsp_storage_version_mismatch(NamespaceId::ROOT, "stateless"),
-            "a similarly prefixed view must not own this view's version marker"
-        );
-
-        let current_marker = dbsp_version_marker_table_name("stateless");
-        add_marker(&mut schema, &current_marker, 3)?;
-        assert!(schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
-
-        let old_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless");
-        add_marker(&mut schema, &old_marker, 4)?;
-        assert!(!schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
-        Ok(())
-    }
 
     use crate::alloc::vec;
 
@@ -9479,264 +9386,6 @@ mod tests {
             None,
         );
         assert!(result.is_err());
-    }
-
-    fn indices(mask: &ColumnMask) -> Vec<usize> {
-        let mut v: Vec<usize> = mask.iter().try_collect().unwrap();
-        v.sort_unstable();
-        v
-    }
-
-    fn stored(bits: &ColumnMask) -> Vec<usize> {
-        let mut v: Vec<usize> = bits.iter().try_collect().unwrap();
-        v.sort_unstable();
-        v
-    }
-
-    #[test]
-    fn gencol_graph_no_virtual_columns() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b)", 0)?;
-        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0]);
-        assert_eq!(indices(&t.columns_affected_by_update([0, 1])?), vec![0, 1]);
-        assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
-        assert_eq!(stored(&t.dependencies_of_columns([])?), Vec::<usize>::new());
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_linear_chain() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL)", 0)?;
-        // affected-by({a}) = {a, b, c}
-        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1, 2]);
-        // affected-by({b}) = {b, c} (b is virtual, but updating it still propagates through dependents)
-        assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
-        // deps-of({c}) = {a} (transitive stored deps of virtual c)
-        assert_eq!(stored(&t.dependencies_of_columns([2])?), vec![0]);
-        // deps-of({b}) = {a}
-        assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
-        // deps-of({a}) = {a} (stored target included)
-        assert_eq!(stored(&t.dependencies_of_columns([0])?), vec![0]);
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_diamond() -> Result<()> {
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-        )?;
-        assert_eq!(
-            indices(&t.columns_affected_by_update([0])?),
-            vec![0, 1, 2, 3]
-        );
-        assert_eq!(stored(&t.dependencies_of_columns([3])?), vec![0]);
-        assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_multiple_stored_roots() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b, c AS (a + b) VIRTUAL)", 0)?;
-        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 2]);
-        assert_eq!(indices(&t.columns_affected_by_update([1])?), vec![1, 2]);
-        assert_eq!(
-            indices(&t.columns_affected_by_update([0, 1])?),
-            vec![0, 1, 2]
-        );
-        assert_eq!(stored(&t.dependencies_of_columns([2])?), vec![0, 1]);
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_empty_input() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
-        assert!(t.columns_affected_by_update(std::iter::empty())?.is_empty());
-        assert!(t.dependencies_of_columns(std::iter::empty())?.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_disjoint_components() -> Result<()> {
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c, d AS (c) VIRTUAL)",
-            0,
-        )?;
-        assert_eq!(indices(&t.columns_affected_by_update([0])?), vec![0, 1]);
-        assert_eq!(indices(&t.columns_affected_by_update([2])?), vec![2, 3]);
-        assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
-        assert_eq!(stored(&t.dependencies_of_columns([3])?), vec![2]);
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_deep_chain() -> Result<()> {
-        // Build 50-long chain: c0 (stored), c1 := c0, c2 := c1, ... c49 := c48.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..50 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_sql(&sql, 0)?;
-        // affected-by({c0}) = {c0..c49}
-        let affected = t.columns_affected_by_update([0])?;
-        assert_eq!(affected.count(), 50);
-        // deps-of({c49}) = {c0}
-        assert_eq!(stored(&t.dependencies_of_columns([49])?), vec![0]);
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_very_deep_chain_no_stack_overflow() -> Result<()> {
-        // Validates that the iterative Kahn's + DP don't blow the stack on
-        // realistic worst-case generated-column depth.
-        let mut sql = String::from("CREATE TABLE t(c0");
-        for i in 1..500 {
-            sql.push_str(&format!(", c{i} AS (c{prev}) VIRTUAL", prev = i - 1));
-        }
-        sql.push(')');
-        let t = BTreeTable::from_sql(&sql, 0)?;
-        assert_eq!(t.columns_affected_by_update([0])?.count(), 500);
-        assert_eq!(stored(&t.dependencies_of_columns([499])?), vec![0]);
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_rowid_sentinel_passthrough() -> Result<()> {
-        let t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
-        let affected = t.columns_affected_by_update([ROWID_SENTINEL])?;
-        // ROWID_SENTINEL is preserved in the mask flag but does not propagate through the graph
-        // (no generated column can depend on ROWID_SENTINEL directly).
-        assert!(affected.get(ROWID_SENTINEL));
-        assert_eq!(affected.count(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_transpose_duality() -> Result<()> {
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b AS (a) VIRTUAL, c AS (b) VIRTUAL, d AS (a + c) VIRTUAL)",
-            0,
-        )?;
-        let graph = t.column_graph()?;
-        // j ∈ dependencies[i] iff i ∈ dependents[j]
-        for i in 0..graph.dependencies.len() {
-            for j in graph.dependencies[i].iter() {
-                assert!(
-                    graph.dependents[j].get(i),
-                    "transpose violated: {j} is in dependencies[{i}] but {i} is not in dependents[{j}]"
-                );
-            }
-            for j in graph.dependents[i].iter() {
-                assert!(
-                    graph.dependencies[j].get(i),
-                    "transpose violated: {j} is in dependents[{i}] but {i} is not in dependencies[{j}]"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_idempotence() -> Result<()> {
-        // affected_by(affected_by(xs)) == affected_by(xs).
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b + c) VIRTUAL)",
-            0,
-        )?;
-        let once = t.columns_affected_by_update([0, 1])?;
-        let twice = t.columns_affected_by_update(once.iter())?;
-        assert_eq!(indices(&twice), indices(&once));
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_union_monotonicity() -> Result<()> {
-        // affected_by(A ∪ B) == affected_by(A) ∪ affected_by(B).
-        let t = BTreeTable::from_sql(
-            "CREATE TABLE t(a, b, c AS (a) VIRTUAL, d AS (b) VIRTUAL, e AS (c + d) VIRTUAL)",
-            0,
-        )?;
-        let mut expected = t.columns_affected_by_update([0])?;
-        let b_mask = t.columns_affected_by_update([1])?;
-        expected.union_with(&b_mask).unwrap();
-        let union_mask = t.columns_affected_by_update([0, 1])?;
-        assert_eq!(indices(&union_mask), indices(&expected));
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::redundant_clone)]
-    fn gencol_graph_clone_invalidates_cache() -> Result<()> {
-        // After cloning a BTreeTable, the cache is fresh. Mutating columns on
-        // the clone via `columns_mut()` keeps it fresh; `prepare_generated_columns`
-        // rebuilds correctly.
-        let original = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
-        // Force the cache to be populated on the original.
-        let _ = original.columns_affected_by_update([0])?;
-        assert!(original.peek_column_dependencies().is_some());
-
-        // Clone: ResetOnClone makes the cloned cache empty. We keep a real clone
-        // (not a move) because the point of the test is that Clone produces a
-        // fresh cache independently from the original.
-        let cloned = original.clone();
-        assert!(cloned.peek_column_dependencies().is_none());
-        // Original's cache is still populated — clone didn't touch it.
-        assert!(original.peek_column_dependencies().is_some());
-
-        // The clone still returns correct results — cache rebuilds lazily.
-        assert_eq!(
-            indices(&cloned.columns_affected_by_update([0])?),
-            vec![0, 1]
-        );
-        assert!(cloned.peek_column_dependencies().is_some());
-        Ok(())
-    }
-
-    #[test]
-    fn gencol_graph_columns_mut_invalidates_cache() -> Result<()> {
-        let mut t = BTreeTable::from_sql("CREATE TABLE t(a, b AS (a) VIRTUAL)", 0)?;
-        // Force the cache to be populated.
-        let _ = t.columns_affected_by_update([0])?;
-        assert!(t.peek_column_dependencies().is_some());
-
-        // Any access through columns_mut() wipes the cache, even if we don't mutate.
-        let _ = t.columns_mut();
-        assert!(t.peek_column_dependencies().is_none());
-        Ok(())
-    }
-
-    /// `install_sequence_descriptor` must surface an error when the
-    /// persisted metadata is invalid (e.g. min > max) rather than
-    /// silently dropping the sequence. The internal backing table is
-    /// the only persistent record of the sequence; a silent drop would
-    /// manifest later as a misleading "sequence does not exist" on the
-    /// next nextval that masks real on-disk corruption.
-    #[test]
-    fn install_sequence_descriptor_rejects_invalid_metadata_with_corruption_error() {
-        let mut schema = Schema::new();
-        let bogus = SequenceMetadata {
-            // increment of zero is universally invalid; Sequence::new
-            // rejects it with a clear error.
-            start: 0,
-            increment: 0,
-            min: 0,
-            max: 100,
-            cycle: false,
-        };
-        let result = schema.install_sequence_descriptor("broken_seq", bogus);
-        let err = result.expect_err(
-            "invalid persisted descriptor must surface as an error, not be silently dropped",
-        );
-        assert!(
-            matches!(err, LimboError::Corrupt(_)),
-            "expected Corrupt error for unreadable internal backing table, got: {err:?}",
-        );
-        assert!(
-            schema
-                .get_sequence(NamespaceId::ROOT, "broken_seq")
-                .is_none(),
-            "rejected descriptor must not land in the sequences map",
-        );
     }
 
     #[test]

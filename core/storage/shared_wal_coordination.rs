@@ -95,11 +95,11 @@ struct ProcessLocalCoordinationEntry {
     /// Number of live mappings in this process for the same canonical tshm path.
     open_count: usize,
     /// Shared publish mutex reused only by tests that bypass `DATABASE_MANAGER`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     frame_index_publish_lock: Arc<Mutex<()>>,
     /// Same-process ownership registry shared only by tests that bypass
     /// `DATABASE_MANAGER`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     ownership: Arc<Mutex<ProcessLocalOwnershipState>>,
 }
 
@@ -388,7 +388,7 @@ fn pid_is_alive(pid: u32) -> bool {
 
 /// Serializable snapshot of the authoritative shared WAL coordination state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SharedWalCoordinationHeader {
+pub struct SharedWalCoordinationHeader {
     pub max_frame: u64,
     pub nbackfills: u64,
     pub transaction_count: u64,
@@ -608,7 +608,7 @@ struct SharedWalFrameIndexEntry {
 /// - `MultiProcess`: at least one other process already has the file open.
 ///   The opener must not clobber state that the peer may be relying on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SharedWalCoordinationOpenMode {
+pub enum SharedWalCoordinationOpenMode {
     Exclusive,
     MultiProcess,
 }
@@ -662,7 +662,7 @@ enum SharedWalOwnershipMode {
      one. Registering a reader before rechecking the shared snapshot relies on this \
      ordering; a private copy of the table or a machine boundary would hide the reader."
 )]
-pub(crate) struct MappedSharedWalCoordination {
+pub struct MappedSharedWalCoordination {
     file: Arc<dyn File>,
     /// Mapping containing the fixed header and reader arrays.
     _base_mapping: Box<dyn SharedWalMappedRegion>,
@@ -686,7 +686,7 @@ pub(crate) struct MappedSharedWalCoordination {
     sanitized_backfill_proof_on_open: bool,
     /// Canonical path used as the key in `PROCESS_LOCAL_COORDINATION_OPENS`.
     registry_path: Option<PathBuf>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     frame_index_blocks_scanned: AtomicU64,
 }
 
@@ -807,7 +807,7 @@ impl MappedSharedWalCoordination {
             open_mode,
             sanitized_backfill_proof_on_open: false,
             registry_path: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             frame_index_blocks_scanned: AtomicU64::new(0),
         }
     }
@@ -826,10 +826,10 @@ impl MappedSharedWalCoordination {
     ) -> Result<ProcessMappingResult> {
         let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mut opens = PROCESS_LOCAL_COORDINATION_OPENS.lock();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test_helper")))]
         let _ = reader_slot_count;
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test_helper"))]
         if let Some(entry) = opens.get_mut(&canonical_path) {
             turso_assert!(
                 entry.ownership.lock().reader_owners.len() == reader_slot_count as usize,
@@ -843,7 +843,7 @@ impl MappedSharedWalCoordination {
             ));
         }
 
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test_helper")))]
         if opens.contains_key(&canonical_path) {
             return Err(LimboError::InternalError(format!(
                 "duplicate same-process shared WAL coordination open for '{}' is unsupported; callers must reuse the existing Database/authority",
@@ -855,9 +855,9 @@ impl MappedSharedWalCoordination {
             canonical_path.clone(),
             ProcessLocalCoordinationEntry {
                 open_count: 1,
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 frame_index_publish_lock: frame_index_publish_lock.clone(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test_helper"))]
                 ownership: process_local_ownership.clone(),
             },
         );
@@ -894,7 +894,7 @@ impl MappedSharedWalCoordination {
         Self::open_existing_with_mode(io, path, reader_slot_count, Self::default_ownership_mode())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     fn create_or_open_process_scoped_for_tests(
         io: &Arc<dyn IO>,
         path: &Path,
@@ -908,16 +908,16 @@ impl MappedSharedWalCoordination {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test_helper"))]
     /// Force the overflow bit for tests that need to exercise fallback WAL scans.
-    pub(crate) fn mark_frame_index_overflowed_for_tests(&self) {
+    pub fn mark_frame_index_overflowed_for_tests(&self) {
         self.header()
             .frame_index_overflowed
             .store(1, Ordering::Release);
     }
 
-    #[cfg(test)]
-    pub(crate) fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
+    #[cfg(any(test, feature = "test_helper"))]
+    pub fn take_frame_index_blocks_scanned_for_tests(&self) -> u64 {
         self.frame_index_blocks_scanned.swap(0, Ordering::Relaxed)
     }
 
@@ -1200,7 +1200,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Read a consistent snapshot of the shared coordination header.
-    pub(crate) fn snapshot(&self) -> SharedWalCoordinationHeader {
+    pub fn snapshot(&self) -> SharedWalCoordinationHeader {
         let header = self.header();
         loop {
             let seq_before = header.snapshot_seq.load(Ordering::Acquire);
@@ -1248,7 +1248,7 @@ impl MappedSharedWalCoordination {
     ///
     /// Any frame-index entries beyond the new tail are discarded first so the
     /// published header and published page-to-frame index stay in sync.
-    pub(crate) fn install_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
+    pub fn install_snapshot(&self, snapshot: SharedWalCoordinationHeader) {
         self.clear_backfill_proof();
         // Snapshots define the authoritative visible WAL range. If the shared
         // frame index still carries entries from an older generation past that
@@ -1354,7 +1354,7 @@ impl MappedSharedWalCoordination {
     /// Discard the durable shared frame index so the caller can rebuild it
     /// from a local WAL scan. The caller must decide separately when that is
     /// safe; this is intentionally distinct from transient-state repair.
-    pub(crate) fn discard_durable_frame_index_for_exclusive_rebuild(&self) {
+    pub fn discard_durable_frame_index_for_exclusive_rebuild(&self) {
         let _publish_guard = self.frame_index_publish_lock.lock();
         let header = self.header();
         header.frame_index_len.store(0, Ordering::Release);
@@ -1362,7 +1362,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Return whether the durable shared frame index exhausted its reserved capacity.
-    pub(crate) fn frame_index_overflowed(&self) -> bool {
+    pub fn frame_index_overflowed(&self) -> bool {
         self.header().frame_index_overflowed.load(Ordering::Acquire) != 0
     }
 
@@ -1411,7 +1411,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Clear the persisted durable proof that positive checkpoint progress is safe to trust.
-    pub(crate) fn clear_backfill_proof(&self) {
+    pub fn clear_backfill_proof(&self) {
         let header = self.header();
         header.backfill_proof_version.store(0, Ordering::Release);
         header.backfill_proof_nbackfills.store(0, Ordering::Release);
@@ -1487,7 +1487,7 @@ impl MappedSharedWalCoordination {
     }
 
     /// Validate the persisted backfill proof against the current WAL snapshot and DB header.
-    pub(crate) fn validate_backfill_proof(
+    pub fn validate_backfill_proof(
         &self,
         snapshot: SharedWalCoordinationHeader,
         db_size_pages: u32,
@@ -2226,7 +2226,7 @@ impl MappedSharedWalCoordination {
         verify = "test",
         id = "reader_slot_frame_zero_means_db_file_reader"
     )]
-    pub(crate) fn min_active_reader_frame(&self) -> Option<u64> {
+    pub fn min_active_reader_frame(&self) -> Option<u64> {
         self.live_reader_frames()
             .filter(|frame| *frame != DB_FILE_READER_FRAME)
             .min()
@@ -2234,7 +2234,7 @@ impl MappedSharedWalCoordination {
 
     /// Whether a reader in any process reads only the database file.
     /// Checkpoints must not backfill any new frame while one is active.
-    pub(crate) fn has_active_db_file_reader(&self) -> bool {
+    pub fn has_active_db_file_reader(&self) -> bool {
         self.live_reader_frames()
             .any(|frame| frame == DB_FILE_READER_FRAME)
     }
@@ -2482,7 +2482,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;
@@ -2509,7 +2509,7 @@ impl MappedSharedWalCoordination {
     /// Used by checkpoint to determine which pages need to be copied from the
     /// WAL to the DB file. For each page, only the highest-numbered frame is
     /// returned (that frame contains the most recent version of the page).
-    pub(crate) fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
+    pub fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)> {
         self.try_iter_latest_frames(min_frame, max_frame)
             .expect("shared WAL enumeration failed")
     }
@@ -2539,7 +2539,7 @@ impl MappedSharedWalCoordination {
         let first_block = slots.start / FRAME_INDEX_BLOCK_CAPACITY;
         let last_block = (slots.end - 1) / FRAME_INDEX_BLOCK_CAPACITY;
         for block_index in (first_block..=last_block).rev() {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test_helper"))]
             self.frame_index_blocks_scanned
                 .fetch_add(1, Ordering::Relaxed);
             let block_start_slot = block_index * FRAME_INDEX_BLOCK_CAPACITY;

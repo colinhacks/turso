@@ -65,9 +65,9 @@ use tantivy::{
 use turso_parser::ast::{self, Select, SortOrder};
 use uncased::UncasedStr;
 
-mod directory;
-mod format;
-mod rows;
+pub mod directory;
+pub mod format;
+pub mod rows;
 
 use directory::{BuildDirectory, FileBytes, SnapshotDirectory};
 use format::{
@@ -197,12 +197,12 @@ static NEXT_FTS_IDENTITY_BASE: AtomicU64 = AtomicU64::new(1);
 /// its own claim on the per-index writer slot across re-entrant calls.
 static NEXT_FTS_CURSOR_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
-const ROWID_FIELD: &str = "rowid";
+pub const ROWID_FIELD: &str = "rowid";
 /// Fast fields that hold each document's identity. The index assigns it
 /// when it first indexes the document, every merge copies it, and it is
 /// the key of the document's tombstone.
-const IDENTITY_HI_FIELD: &str = "doc_identity_hi";
-const IDENTITY_LO_FIELD: &str = "doc_identity_lo";
+pub const IDENTITY_HI_FIELD: &str = "doc_identity_hi";
+pub const IDENTITY_LO_FIELD: &str = "doc_identity_lo";
 
 // Thread-local tokenizer cache to avoid creating a new tokenizer for each call.
 // TextAnalyzer is not Send/Sync, so we use thread_local storage.
@@ -344,8 +344,12 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
 pub struct FtsIndexMethod;
 
 impl IndexMethod for FtsIndexMethod {
-    fn attach(&self, cfg: &IndexMethodConfiguration) -> Result<Arc<dyn IndexMethodAttachment>> {
-        let attachment = FtsIndexAttachment::new(cfg.clone())?;
+    fn attach(
+        &self,
+        dialect: &dyn crate::dialect::Dialect,
+        cfg: &IndexMethodConfiguration,
+    ) -> Result<Arc<dyn IndexMethodAttachment>> {
+        let attachment = FtsIndexAttachment::new(dialect, cfg.clone())?;
         Ok(Arc::new(attachment))
     }
 
@@ -471,7 +475,7 @@ struct FtsRuntimeStats {
 /// discoverable through visible registry rows, so other snapshots can never
 /// look them up; rollback purges them.
 #[derive(Debug, Default)]
-struct SegmentByteCache {
+pub struct SegmentByteCache {
     /// Least recently used first.
     entries: Vec<(SegmentId, Arc<SegmentData>)>,
 }
@@ -483,7 +487,7 @@ impl SegmentByteCache {
         })
     }
 
-    fn get(&mut self, id: &SegmentId) -> Option<Arc<SegmentData>> {
+    pub fn get(&mut self, id: &SegmentId) -> Option<Arc<SegmentData>> {
         if fts_max_retained_cache_bytes() == 0 {
             self.entries.clear();
             return None;
@@ -495,7 +499,7 @@ impl SegmentByteCache {
         Some(data)
     }
 
-    fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
+    pub fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
         if budget == 0 {
             self.entries.clear();
             return;
@@ -518,7 +522,7 @@ impl SegmentByteCache {
 /// silently produce wrong query results.
 type SearcherKey = Vec<(SegmentId, u32, BTreeSet<u32>)>;
 
-fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
+pub fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
     let mut key: SearcherKey = segments
         .iter()
         .map(|segment| {
@@ -533,7 +537,7 @@ fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
     key
 }
 
-struct SearcherCacheEntry {
+pub struct SearcherCacheEntry {
     key: SearcherKey,
     index: Index,
     reader: IndexReader,
@@ -542,13 +546,13 @@ struct SearcherCacheEntry {
 }
 
 #[derive(Default)]
-struct SearcherCache {
+pub struct SearcherCache {
     /// Least recently used first.
     entries: Vec<SearcherCacheEntry>,
 }
 
 impl SearcherCache {
-    fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
+    pub fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
         if fts_max_retained_cache_bytes() == 0 {
             self.entries.clear();
             return None;
@@ -579,9 +583,9 @@ impl SearcherCache {
 
 /// Attachment-level shared state.
 #[derive(Default)]
-struct FtsShared {
-    segment_bytes: Mutex<SegmentByteCache>,
-    searchers: Mutex<SearcherCache>,
+pub struct FtsShared {
+    pub segment_bytes: Mutex<SegmentByteCache>,
+    pub searchers: Mutex<SearcherCache>,
     /// The one cursor currently allowed to flush this index per connection.
     writer_slot: Mutex<Option<FtsWriterSlot>>,
     /// Throwaway index used only to mint `SegmentMeta` values for
@@ -611,7 +615,7 @@ impl FtsShared {
     /// It is an empty in-RAM index with this attachment's schema: nothing is
     /// ever written to or read from it, and one instance is shared by every
     /// cursor of the attachment.
-    fn scratch_index(&self, schema: &Schema) -> Result<Index> {
+    pub fn scratch_index(&self, schema: &Schema) -> Result<Index> {
         let mut scratch = self.scratch.lock();
         if let Some(index) = scratch.as_ref() {
             return Ok(index.clone());
@@ -633,22 +637,22 @@ pub struct FtsIndexAttachment {
     /// Internal configuration
     cfg: IndexMethodConfiguration,
     /// Tantivy schema for the FTS index
-    schema: Schema,
+    pub schema: Schema,
     /// Tantivy field for the rowid column
-    rowid_field: Field,
+    pub rowid_field: Field,
     /// Tantivy fields for the document identity
     identity_hi_field: Field,
     identity_lo_field: Field,
     /// Schema fields for each indexed column
-    indexed_fields: Vec<(IndexColumn, Field)>,
+    pub indexed_fields: Vec<(IndexColumn, Field)>,
     /// Parsed query patterns for FTS queries
-    patterns: Vec<Select>,
+    pub patterns: Vec<Select>,
     /// Weights for each field in FTS scoring, from the WITH clause.
     field_weights: HashMap<String, f32>,
     /// (min_gram, max_gram) for the ngram tokenizer, from the WITH clause
     /// `min_gram`/`max_gram` keys. [DEFAULT_NGRAM_WINDOW] unless configured.
     ngram_window: (usize, usize),
-    shared: Arc<FtsShared>,
+    pub shared: Arc<FtsShared>,
 }
 
 /// Supported tokenizer names for FTS indexes
@@ -685,7 +689,10 @@ impl FtsIndexAttachment {
         verify = "neural",
         id = "fts_with_keys_all_validated_and_consumed"
     )]
-    pub fn new(cfg: IndexMethodConfiguration) -> Result<Self> {
+    pub fn new(
+        dialect: &dyn crate::dialect::Dialect,
+        cfg: IndexMethodConfiguration,
+    ) -> Result<Self> {
         // Validate WITH clause keys the same way bad values are validated:
         // a typo like `tokenzier` must be an error, not a silently different
         // index. Keys are matched case-insensitively.
@@ -894,15 +901,18 @@ impl FtsIndexAttachment {
         let match_limit = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?) LIMIT ?");
         // Pattern 6: match (no LIMIT)
         let match_pattern = format!("SELECT * FROM {table} WHERE fts_match({cols}, ?)");
-        let patterns = parse_patterns(&[
-            &score_pattern,          // 0
-            &combined_ordered_limit, // 1
-            &combined_ordered,       // 2
-            &combined_limit,         // 3
-            &combined,               // 4
-            &match_limit,            // 5
-            &match_pattern,          // 6
-        ])?;
+        let patterns = parse_patterns(
+            dialect,
+            &[
+                &score_pattern,          // 0
+                &combined_ordered_limit, // 1
+                &combined_ordered,       // 2
+                &combined_limit,         // 3
+                &combined,               // 4
+                &match_limit,            // 5
+                &match_pattern,          // 6
+            ],
+        )?;
         Ok(Self {
             cfg,
             schema,
@@ -999,6 +1009,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
 
     fn rename_column(
         &self,
+        dialect: &dyn crate::dialect::Dialect,
         from: &str,
         to: &str,
     ) -> Result<Option<Arc<dyn IndexMethodAttachment>>> {
@@ -1025,18 +1036,18 @@ impl IndexMethodAttachment for FtsIndexAttachment {
                 *weights = crate::types::Text::new(renamed_weights);
             }
         }
-        Ok(Some(Arc::new(FtsIndexAttachment::new(cfg)?)))
+        Ok(Some(Arc::new(FtsIndexAttachment::new(dialect, cfg)?)))
     }
 }
 
 /// Pattern indices for FTS queries
-const FTS_PATTERN_SCORE: i64 = 0;
-const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
-const FTS_PATTERN_COMBINED_ORDERED: i64 = 2;
+pub const FTS_PATTERN_SCORE: i64 = 0;
+pub const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
+pub const FTS_PATTERN_COMBINED_ORDERED: i64 = 2;
 const FTS_PATTERN_COMBINED_LIMIT: i64 = 3;
-const FTS_PATTERN_COMBINED: i64 = 4;
-pub(crate) const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
-pub(crate) const FTS_PATTERN_MATCH: i64 = 6;
+pub const FTS_PATTERN_COMBINED: i64 = 4;
+pub const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
+pub const FTS_PATTERN_MATCH: i64 = 6;
 
 fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
     let live_docs = usize::try_from(live_docs).unwrap_or(usize::MAX);
@@ -1051,13 +1062,13 @@ fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
 // ============================ cursor ============================
 
 /// One document buffered for the next segment build.
-struct BufferedDoc {
-    rowid: i64,
-    doc: TantivyDocument,
+pub struct BufferedDoc {
+    pub rowid: i64,
+    pub doc: TantivyDocument,
 }
 
 /// In-memory effects to apply once a publish's rows are durably staged.
-enum PublishApply {
+pub enum PublishApply {
     /// Nothing beyond the rows themselves (the control row).
     Nothing,
     /// A statement flush: append the new segment (if any) to the visible
@@ -1069,10 +1080,10 @@ enum PublishApply {
 
 /// A resumable row publication: delete rows, then insert rows, then apply
 /// the in-memory effects exactly once.
-struct PendingPublish {
+pub struct PendingPublish {
     inserter: Option<RowInserter>,
-    deleter: Option<RowDeleter>,
-    apply: PublishApply,
+    pub deleter: Option<RowDeleter>,
+    pub apply: PublishApply,
 }
 
 /// Driver states for the open/scan machine. Everything that must survive
@@ -1213,7 +1224,7 @@ pub struct FtsCursor {
     default_fields: Vec<Field>,
     /// Pre-computed (Field, boost) pairs for QueryParser (avoids re-iterating per query)
     field_boosts: Vec<(Field, f32)>,
-    shared: Arc<FtsShared>,
+    pub shared: Arc<FtsShared>,
     /// This cursor's identity in [`FtsWriterSlot`] claims.
     cursor_instance_id: u64,
     /// Weak so a cursor parked on its connection does not keep the
@@ -1230,8 +1241,8 @@ pub struct FtsCursor {
     /// The snapshot's visible segment set (descriptors + resident bytes +
     /// tombstone state), including this transaction's own published
     /// segments. Valid once `snapshot_loaded`.
-    segments: Vec<LoadedSegment>,
-    snapshot_loaded: bool,
+    pub segments: Vec<LoadedSegment>,
+    pub snapshot_loaded: bool,
 
     // Scratch for the open/scan machine.
     scan_descriptors: Vec<SegmentDescriptor>,
@@ -1245,18 +1256,18 @@ pub struct FtsCursor {
     // Assembled Tantivy view.
     index: Option<Index>,
     reader: Option<IndexReader>,
-    searcher: Option<Searcher>,
-    cached_parser: Option<Arc<tantivy::query::QueryParser>>,
-    rowid_readers: Arc<[Column<i64>]>,
+    pub searcher: Option<Searcher>,
+    pub cached_parser: Option<Arc<tantivy::query::QueryParser>>,
+    pub rowid_readers: Arc<[Column<i64>]>,
 
     // Write buffers.
-    doc_buffer: Vec<BufferedDoc>,
+    pub doc_buffer: Vec<BufferedDoc>,
     /// Identities of the documents deleted since the last flush. The next
     /// flush writes them as tombstone rows. The same tombstones are already
     /// in `segments[..].deleted`, which this transaction's own reads use.
     pending_tombstone_rows: Vec<DocumentIdentity>,
     /// Row publication in flight (statement flush, control row, or merge).
-    publish: Option<PendingPublish>,
+    pub publish: Option<PendingPublish>,
     /// A merge that is still claiming its input segments.
     merge_claim: Option<SegmentClaimer>,
     optimize_state: OptimizeState,
@@ -1280,7 +1291,7 @@ pub struct FtsCursor {
 
 impl FtsCursor {
     /// Creates a new FTS cursor with the given configuration.
-    fn new(attachment: &FtsIndexAttachment) -> Self {
+    pub fn new(attachment: &FtsIndexAttachment) -> Self {
         let store = FtsStore::new(&attachment.cfg.index_name);
         let indexed_fields = attachment.indexed_fields.clone();
         let default_fields: Vec<Field> = indexed_fields.iter().map(|(_, f)| *f).collect();
@@ -1457,7 +1468,7 @@ impl FtsCursor {
     /// Assemble the Tantivy view (index, reader, searcher, parser) over the
     /// cursor's in-memory segment set, consulting the shared searcher cache
     /// first. Pure CPU work — every byte is already resident.
-    fn build_snapshot_view(&mut self, publish_to_cache: bool) -> Result<()> {
+    pub fn build_snapshot_view(&mut self, publish_to_cache: bool) -> Result<()> {
         let key = searcher_key(&self.segments);
         self.shared
             .stats
@@ -1555,7 +1566,7 @@ impl FtsCursor {
     }
 
     /// Invalidate the assembled view after the segment set changed.
-    fn invalidate_snapshot_view(&mut self) {
+    pub fn invalidate_snapshot_view(&mut self) {
         self.index = None;
         self.reader = None;
         self.searcher = None;
@@ -1564,7 +1575,7 @@ impl FtsCursor {
     }
 
     /// Make sure `self.searcher` reflects the current in-memory segment set.
-    fn ensure_searcher(&mut self) -> Result<()> {
+    pub fn ensure_searcher(&mut self) -> Result<()> {
         if self.searcher.is_some() {
             return Ok(());
         }
@@ -2175,7 +2186,7 @@ impl FtsCursor {
     /// `SegmentUpdater` handoff: no `meta.json` write reaches storage, no
     /// `.managed.json`, no lock file, no merge. Returns `None` when the
     /// buffer produced no documents.
-    fn build_segment(&mut self) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
+    pub fn build_segment(&mut self) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
         let build_dir = BuildDirectory::new(self.allocator.clone());
         // `Index::create` writes the initial meta.json into the build
         // directory's in-memory slot; it never reaches the B-tree.
@@ -2336,7 +2347,7 @@ impl FtsCursor {
     /// rows, keep the rest untouched. The caller already deleted the
     /// registry rows of the claimed segments through `drive_merge_claim`,
     /// holds the writer slot, and drives the staged publication afterwards.
-    fn stage_merge_of_segments(&mut self, candidate_ids: &HashSet<SegmentId>) -> Result<()> {
+    pub fn stage_merge_of_segments(&mut self, candidate_ids: &HashSet<SegmentId>) -> Result<()> {
         self.ensure_searcher()?;
         let index = self
             .index
@@ -2528,7 +2539,7 @@ impl FtsCursor {
     /// set. One rowid-term lookup per segment, checked against the
     /// transaction's own tombstone state (the searcher's alive bitsets may
     /// lag behind tombstones applied since the view was built).
-    fn live_postings_for_rowid(&mut self, rowid: i64) -> Result<Vec<(SegmentId, u32)>> {
+    pub fn live_postings_for_rowid(&mut self, rowid: i64) -> Result<Vec<(SegmentId, u32)>> {
         if self.segments.is_empty() {
             return Ok(Vec::new());
         }
@@ -2665,7 +2676,7 @@ fn segment_data_from_files(
 /// position order. This opens the segment alone through a synthesized
 /// snapshot view. No tombstones apply, because a reader needs the
 /// identities of deleted documents to find their positions.
-fn read_segment_identities(
+pub fn read_segment_identities(
     scratch: &Index,
     schema: &Schema,
     segment_id: SegmentId,
@@ -2813,7 +2824,7 @@ fn assemble_chunks(
 /// Re-key captured segment files from segment id `from` to `to`. Tantivy
 /// names every component `<segment uuid>.<ext>`; the bytes never carry the
 /// id, so a rename is all a merged segment needs to take a minted id.
-fn rename_segment_files(
+pub fn rename_segment_files(
     files: HashMap<PathBuf, FileBytes>,
     from: &SegmentId,
     to: &SegmentId,
@@ -2837,7 +2848,7 @@ fn rename_segment_files(
         .collect()
 }
 
-fn segment_rows_from_files(
+pub fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,
     captured: HashMap<PathBuf, FileBytes>,

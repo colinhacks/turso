@@ -101,7 +101,7 @@ impl TransactionState {
     }
 }
 
-pub(crate) struct TempDatabase {
+pub struct TempDatabase {
     pub(crate) db: Arc<Database>,
     pub(crate) pager: Arc<Pager>,
     #[cfg(not(target_family = "wasm"))]
@@ -470,8 +470,8 @@ pub struct Connection {
     pub db: Arc<Database>,
     pub(super) context: Option<Arc<dyn Any + Send + Sync>>,
     pub(super) hooks: Option<Arc<dyn ConnectionHooks>>,
-    pub(crate) pager: ArcSwap<Pager>,
-    pub(crate) schema: RwLock<Arc<Schema>>,
+    pub pager: ArcSwap<Pager>,
+    pub schema: RwLock<Arc<Schema>>,
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
@@ -518,10 +518,10 @@ pub struct Connection {
     /// snapshot, dirty-schema flag). See `TempDbContext`.
     pub(crate) temp: TempDbContext,
     /// Attached databases
-    pub(super) attached_databases: RwLock<DatabaseCatalog>,
+    pub attached_databases: RwLock<DatabaseCatalog>,
     /// The names that qualify object names in SQL, each referring to a
     /// database.
-    pub(super) qualifiers: Qualifiers,
+    pub qualifiers: Qualifiers,
     /// The namespace names that a name without a namespace is looked up
     /// through, in order. None means main, then the other databases by id.
     pub(super) search_path: RwLock<Option<Vec<String>>>,
@@ -585,7 +585,7 @@ pub struct Connection {
 
     /// Ordered row changes captured once per connection transaction, with
     /// consumer indexes for materialized-view maintenance.
-    pub(crate) transaction_changes: crate::incremental::view::TransactionChanges,
+    pub transaction_changes: crate::incremental::view::TransactionChanges,
     /// Prepared IVM bytecode keyed by schema epoch and physical view layout.
     pub(crate) maintenance_program_cache:
         crate::incremental::vdbe_maintenance::MaintenanceProgramCache,
@@ -603,7 +603,7 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
-    pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
+    pub encryption_key: RwLock<Option<EncryptionKey>>,
     pub(super) encryption_cipher_mode: AtomicCipherMode,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
@@ -1235,7 +1235,7 @@ impl Connection {
                 // An engine schema statement is the engine's own SQLite text,
                 // whatever the database's dialect parses.
                 if matches!(origin, StatementOrigin::EngineSchemaWrite) {
-                    crate::dialect::Dialect::parse(&crate::dialect::EngineDialect, sql)?
+                    self.dialect().parse_internal(sql)?
                 } else {
                     self.parse_sql(sql)?
                 }
@@ -1510,7 +1510,7 @@ impl Connection {
     /// Retained for the many synchronous callers (statement reprepare, attach,
     /// extension load, vacuum). The genuinely non-blocking callers (MVCC
     /// bootstrap, the open-db state machine) drive `*_nonblock` directly.
-    pub(crate) fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
+    pub fn reparse_schema(self: &Arc<Connection>) -> Result<()> {
         let io = self.pager.load().io.clone();
         let mut state = ReparseSchemaState::default();
         io.block(|| self.reparse_schema_nonblock(&mut state))
@@ -1657,7 +1657,9 @@ impl Connection {
                             rows: Vec::new(),
                         };
                     } else {
-                        inner.fresh.load_namespace_names(&[])?;
+                        inner
+                            .fresh
+                            .load_namespace_names(self.db.dialect().as_ref(), &[])?;
                         inner.phase = ReparsePhase::populate_sequences();
                     }
                 }
@@ -1666,7 +1668,9 @@ impl Connection {
                         rows.push((row.get::<i64>(0)?, row.get::<&str>(1)?.to_string()));
                         Ok(())
                     }));
-                    inner.fresh.load_namespace_names(rows)?;
+                    inner
+                        .fresh
+                        .load_namespace_names(self.db.dialect().as_ref(), rows)?;
                     // Next: recover sequence descriptors (or graft the VACUUM map).
                     inner.phase = ReparsePhase::populate_sequences();
                 }
@@ -1793,6 +1797,7 @@ impl Connection {
                 }
                 ReparsePhase::BuildIndexes { type_sqls } => {
                     crate::util::populate_types_views_then_indices(
+                        self.db.dialect().as_ref(),
                         &mut inner.parse,
                         &mut inner.fresh,
                         &self.syms.read(),
@@ -1904,7 +1909,7 @@ impl Connection {
     /// statement compiled in between must not see it empty: without it, no
     /// role exists and no table has an owner, privileges or row-level
     /// security.
-    fn install_schema_keeping_dialect_schema(&self, fresh: &Schema) -> Result<()> {
+    pub fn install_schema_keeping_dialect_schema(&self, fresh: &Schema) -> Result<()> {
         self.with_schema_mut(|schema| {
             let mut installed = fresh.try_clone()?;
             installed.dialect_schema.clone_from(&schema.dialect_schema);
@@ -3204,6 +3209,7 @@ impl Connection {
 
             // The schema already holds every stored type.
             match schema.populate_types_views_then_indices(
+                self.db.dialect().as_ref(),
                 &syms,
                 &[],
                 materialized_view_info,
@@ -3472,7 +3478,7 @@ impl Connection {
         self.db.initialized()
     }
 
-    pub(crate) fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
+    pub fn get_pager_from_database_index(&self, index: &usize) -> Result<Arc<Pager>> {
         match *index {
             crate::MAIN_DB_ID => Ok(self.pager.load().clone()),
             crate::TEMP_DB_ID => {
@@ -4947,7 +4953,7 @@ impl Connection {
         matches!(self.get_tx_state(), TransactionState::Write { .. })
     }
 
-    pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
+    pub fn get_mv_tx_id(&self) -> Option<u64> {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
 
@@ -4972,7 +4978,7 @@ impl Connection {
 
     /// Get MVCC transaction ID for a specific database.
     /// Uses fast path for main DB, O(1) HashMap lookup for attached DBs.
-    pub(crate) fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
+    pub fn get_mv_tx_id_for_db(&self, db: usize) -> Option<u64> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx_id()
         } else {
@@ -4984,7 +4990,7 @@ impl Connection {
     }
 
     /// Get MVCC transaction ID and mode for a specific database.
-    pub(crate) fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
+    pub fn get_mv_tx_for_db(&self, db: usize) -> Option<(u64, TransactionMode)> {
         if db == crate::MAIN_DB_ID {
             self.get_mv_tx()
         } else {
@@ -5335,7 +5341,7 @@ impl Connection {
 
     /// Get the MvStore for a specific database.
     /// Returns None for databases without MVCC or for bootstrap connections.
-    pub(crate) fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
+    pub fn mv_store_for_db(&self, db: usize) -> Option<Arc<MvStore>> {
         if self.is_mvcc_bootstrap_connection() {
             return None;
         }
@@ -5517,184 +5523,5 @@ impl SymbolTable {
         for (name, module) in &other.index_methods {
             self.index_methods.insert(name.clone(), module.clone());
         }
-    }
-}
-
-#[cfg(all(test, feature = "fs"))]
-mod tests {
-    use super::*;
-    use crate::attach::AttachDatabaseState;
-    use crate::security::roles::SessionRole;
-    use crate::ConnectOpts;
-    use crate::EngineDialect;
-    use crate::IOResult;
-    use tempfile::TempDir;
-
-    fn open_connection_with_opts(path: &std::path::Path, opts: DatabaseOpts) -> Arc<Connection> {
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        let db = Database::open_file_with_flags(
-            io,
-            path.to_str().unwrap(),
-            OpenFlags::default(),
-            opts,
-            None,
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        db.connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap()
-    }
-
-    fn open_connection(path: &std::path::Path) -> Arc<Connection> {
-        open_connection_with_opts(path, DatabaseOpts::new())
-    }
-
-    fn drive_attach(conn: &Arc<Connection>, path: &str, alias: &str) -> Result<()> {
-        let mut state = AttachDatabaseState::default();
-        loop {
-            match conn.attach_database(path, alias, &mut state)? {
-                IOResult::Done(()) => return Ok(()),
-                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
-            }
-        }
-    }
-
-    fn drive_attach_with_config(
-        conn: &Arc<Connection>,
-        path: &str,
-        alias: &str,
-        reserved_space: Option<u8>,
-    ) -> Result<()> {
-        let mut state = AttachDatabaseState::default();
-        loop {
-            match conn.attach_database_with_config(path, alias, reserved_space, &mut state)? {
-                IOResult::Done(()) => return Ok(()),
-                IOResult::IO(io) => io.wait(conn.db.io.as_ref())?,
-            }
-        }
-    }
-
-    // given a attached 'alias', return the Database and Pager for that attached database
-    fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
-        let index = conn.qualifiers.database_id(alias).unwrap();
-        let catalog = conn.attached_databases.read();
-        let entry = catalog.index_to_data.get(&index).unwrap();
-        (entry.db.clone(), entry.pager.clone())
-    }
-
-    #[test]
-    fn test_attach_database_with_config_overrides_reserved_space_before_initialization() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        drive_attach_with_config(&conn, aux_path.to_str().unwrap(), "aux", Some(48)).unwrap();
-
-        let (attached_db, pager) = attached_entry(&conn, "aux");
-        assert!(!attached_db.initialized());
-        assert!(!pager.db_initialized());
-        assert_eq!(pager.get_reserved_space(), Some(48));
-    }
-
-    #[cfg(feature = "checksum")]
-    #[test]
-    fn test_attach_database_with_config_rejects_reserved_space_below_minimum() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        let err = drive_attach_with_config(&conn, aux_path.to_str().unwrap(), "aux", Some(0))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            err,
-            "cannot attach database 'aux': reserved space 0 is smaller than attached database minimum 8"
-        );
-    }
-
-    #[test]
-    fn test_fresh_mvcc_attach_installs_wal_before_bootstrap() {
-        // this is a test to check that mvcc db on attach with a fresh db, makes the
-        // attached db also mvcc
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-
-        let (attached_db, pager) = attached_entry(&conn, "aux");
-        assert!(attached_db.get_mv_store().as_ref().is_some());
-        assert!(pager.has_wal());
-
-        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
-        conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)").unwrap();
-    }
-
-    #[test]
-    fn test_fresh_mvcc_attach_reuses_database_shared_wal() {
-        let temp_dir = TempDir::new().unwrap();
-        let main_path = temp_dir.path().join("main.db");
-        let aux_path = temp_dir.path().join("aux.db");
-        let conn = open_connection(&main_path);
-
-        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
-        drive_attach(&conn, aux_path.to_str().unwrap(), "aux").unwrap();
-        conn.execute("CREATE TABLE aux.t(x INTEGER)").unwrap();
-        conn.execute("INSERT INTO aux.t VALUES(1)").unwrap();
-
-        let (attached_db, pager) = attached_entry(&conn, "aux");
-        let pager_shared_ptr = pager
-            .wal_shared_ptr()
-            .expect("fresh MVCC attach must expose WAL shared state in tests");
-        let db_shared_ptr = Arc::as_ptr(&attached_db.shared_wal) as usize;
-
-        assert_eq!(pager_shared_ptr, db_shared_ptr);
-    }
-
-    #[test]
-    fn test_prepared_statement_reprepares_after_automatic_index_pragma() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("main.db");
-        let conn = open_connection(&db_path);
-
-        conn.execute("CREATE TABLE t1(a)").unwrap();
-        let mut stmt = conn.prepare("SELECT a FROM t1").unwrap();
-
-        conn.execute("PRAGMA automatic_index = OFF").unwrap();
-        stmt.run_collect_rows().unwrap();
-
-        let reprepares = stmt.stmt_status(crate::statement::StatementStatusCounter::Reprepare);
-        assert_eq!(reprepares, 1);
-    }
-
-    /// The reparse of the schema installs a fresh schema before the
-    /// dialect's schema state is read, and a statement compiled meanwhile
-    /// must not see it empty.
-    #[test]
-    fn schema_installed_while_being_read_keeps_the_loaded_dialect_schema() {
-        let db = Database::open_file(
-            Arc::new(crate::MemoryIO::new()),
-            ":memory:",
-            Arc::new(EngineDialect),
-        )
-        .unwrap();
-        let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
-            .unwrap();
-        conn.with_schema_mut(|schema| {
-            schema.dialect_schema = Some(Arc::new(()));
-        })
-        .unwrap();
-        let fresh = Schema::with_options(false, &EngineDialect).unwrap();
-        assert!(fresh.dialect_schema.is_none());
-
-        conn.install_schema_keeping_dialect_schema(&fresh).unwrap();
-
-        assert!(conn.schema.read().dialect_schema.is_some());
     }
 }

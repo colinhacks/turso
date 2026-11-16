@@ -1,14 +1,27 @@
+pub(crate) mod resolver;
 mod test_alter_table_reopen;
+mod test_analyze_stats;
 mod test_btree;
+mod test_collation;
+mod test_create_index_translation;
 mod test_ddl;
 mod test_eqp_json;
+mod test_expr_type;
 mod test_hash_join_materialization;
 mod test_in_seek;
 mod test_is_seek;
+mod test_join_order;
 mod test_materialized_view_commit;
+mod test_multi_index_plan;
 mod test_multi_index_scan;
+mod test_optimizer;
+mod test_program_execution;
 mod test_read_path;
+mod test_row_security;
+mod test_translate;
+mod test_typed_value_order;
 mod test_vacuum;
+mod test_vacuum_internals;
 mod test_vacuum_into_mvcc;
 mod test_write_path;
 
