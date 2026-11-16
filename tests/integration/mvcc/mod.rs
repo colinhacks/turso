@@ -113,8 +113,11 @@ impl turso_core::mvcc::persistent_storage::DurableStorage for RecordingDurableSt
         self.inner.truncate(checkpointed_through_ts)
     }
 
-    fn reset_to_fresh_header(&self) -> turso_core::Result<turso_core::Completion> {
-        self.inner.reset_to_fresh_header()
+    fn reset_to_fresh_header(
+        &self,
+        reservation: &turso_core::ExternalRestoreGuard,
+    ) -> turso_core::Result<turso_core::Completion> {
+        self.inner.reset_to_fresh_header(reservation)
     }
 
     fn get_logical_log_file(&self) -> Arc<dyn turso_core::File> {

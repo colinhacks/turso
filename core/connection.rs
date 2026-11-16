@@ -30,7 +30,7 @@ use crate::{
     translate,
     translate::collate::TextCollation,
     util::IOExt,
-    vdbe, AtomicCipherMode, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
+    vdbe, AtomicSyncMode, AtomicTempStore, BusyHandler, BusyHandlerCallback,
     CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd, Completion,
     ConnectOpts, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
@@ -46,7 +46,6 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
-use crate::security::roles::SessionRole;
 use std::fmt::Display;
 use std::ops::Deref;
 #[cfg(feature = "simulator")]
@@ -603,8 +602,7 @@ pub struct Connection {
     /// Stack of currently executing triggers to prevent recursive trigger execution
     /// Only prevents the same trigger from firing again, allowing different triggers on the same table to fire
     pub executing_triggers: RwLock<Vec<Arc<Trigger>>>,
-    pub(crate) encryption_key: RwLock<Option<EncryptionKey>>,
-    pub(super) encryption_cipher_mode: AtomicCipherMode,
+    pub(crate) encryption_key: Option<EncryptionKey>,
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) data_sync_retry: AtomicBool,
@@ -2045,19 +2043,6 @@ impl Connection {
         use crate::util::MEMORY_PATH;
         let opts = OpenOptions::parse(uri)?;
         let flags = opts.get_flags()?;
-        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
-            let io = Arc::new(MemoryIO::new());
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                MEMORY_PATH,
-                flags,
-                db_opts,
-                None,
-                dialect,
-            )?;
-            let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-            return Ok((io, conn));
-        }
         let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
             (Some(_), None) => {
@@ -2072,6 +2057,26 @@ impl Connection {
             }
             (None, None) => None,
         };
+        if opts.path == MEMORY_PATH || matches!(opts.mode, OpenMode::Memory) {
+            let io = Arc::new(MemoryIO::new());
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                MEMORY_PATH,
+                flags,
+                db_opts,
+                encryption_opts.clone(),
+                dialect,
+            )?;
+            let conn = db.connect(
+                ConnectOpts::new(crate::SessionRole::Superuser).with_encryption_key(
+                    encryption_opts
+                        .as_ref()
+                        .map(|opts| EncryptionKey::from_hex_string(&opts.hexkey))
+                        .transpose()?,
+                ),
+            )?;
+            return Ok((io, conn));
+        }
         let (io, db) = Database::open_new(
             &opts.path,
             opts.vfs.as_ref(),
@@ -2085,61 +2090,14 @@ impl Connection {
             std::fs::set_permissions(&opts.path, perms.permissions())
                 .map_err(|e| io_error(e, "set_permissions"))?;
         }
-        let conn = db.connect(ConnectOpts::new(SessionRole::Superuser))?;
-        if let Some(cipher) = opts.cipher {
-            let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
-        }
-        if let Some(hexkey) = opts.hexkey {
-            let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
-        }
+        let key = opts
+            .hexkey
+            .as_deref()
+            .map(EncryptionKey::from_hex_string)
+            .transpose()?;
+        let conn =
+            db.connect(ConnectOpts::new(crate::SessionRole::Superuser).with_encryption_key(key))?;
         Ok((io, conn))
-    }
-
-    #[cfg(feature = "fs")]
-    pub(crate) fn from_uri_attached(
-        uri: &str,
-        mut db_opts: DatabaseOpts,
-        main_db_flags: OpenFlags,
-        io: Arc<dyn IO>,
-        dialect: Arc<dyn crate::Dialect>,
-    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
-        let opts = OpenOptions::parse(uri)?;
-        let mut flags = opts.get_flags()?;
-        if main_db_flags.contains(OpenFlags::ReadOnly) {
-            flags |= OpenFlags::ReadOnly;
-        }
-        let encryption_opts = match (opts.cipher.clone(), opts.hexkey.clone()) {
-            (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
-            (Some(_), None) => {
-                return Err(LimboError::InvalidArgument(
-                    "hexkey is required when cipher is provided".to_string(),
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(LimboError::InvalidArgument(
-                    "cipher is required when hexkey is provided".to_string(),
-                ));
-            }
-            (None, None) => None,
-        };
-        if encryption_opts.is_some() {
-            db_opts = db_opts.with_encryption(true);
-        }
-        let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
-        )?;
-        if let Some(modeof) = opts.modeof {
-            let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
-            std::fs::set_permissions(&opts.path, perms.permissions())
-                .map_err(|e| io_error(e, "set_permissions"))?;
-        }
-        Ok((db, encryption_opts))
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
@@ -2338,7 +2296,8 @@ impl Connection {
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
         let current_schema = self.schema.read().clone();
-        let schema = self.db.schema.lock().clone();
+        let shared_schema = self.db.schema.lock();
+        let schema = shared_schema.clone();
         if current_schema.schema_version < schema.schema_version
             || (self.has_no_open_transaction_state()
                 && self
@@ -2519,12 +2478,14 @@ impl Connection {
     /// If attempt to write frame at the position `frame_no` will create gap in the WAL - method will return error
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
+        let _restore_permit = self.preflight_external_restore()?;
         self.pager.load().wal_insert_frame(frame_no, frame)
     }
 
     /// Start WAL session by initiating read+write transaction for this connection
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_begin(&self) -> Result<()> {
+        let _restore_permit = self.preflight_external_restore()?;
         let pager = self.pager.load();
         pager.begin_read_tx()?;
         // Sync-engine drives WAL maintenance explicitly: any auto-restart of
@@ -2767,6 +2728,11 @@ impl Connection {
         self.db.update_schema_if_newer(schema);
     }
 
+    #[cfg(feature = "conn_raw_api")]
+    pub fn preflight_external_restore(&self) -> Result<crate::ExternalRestorePermit> {
+        self.db.preflight_external_restore()
+    }
+
     /// Publish the connection's current schema snapshot after pages were
     /// replaced outside normal SQL commit ordering.
     ///
@@ -2774,7 +2740,11 @@ impl Connection {
     /// case the shared schema cache must be replaced rather than updated
     /// monotonically, otherwise new connections can re-adopt stale metadata.
     #[cfg(feature = "conn_raw_api")]
-    pub fn publish_schema_after_external_restore(&self) -> Result<()> {
+    pub fn publish_schema_after_external_restore(
+        &self,
+        permit: &crate::ExternalRestorePermit,
+    ) -> Result<()> {
+        self.db.validate_external_restore_permit(permit)?;
         if self.get_tx_state() != TransactionState::None {
             return Err(LimboError::Busy);
         }
@@ -2842,8 +2812,11 @@ impl Connection {
     }
 
     #[cfg(feature = "conn_raw_api")]
-    pub fn reload_wal_after_external_restore(&self) -> Result<()> {
-        self.db.reload_wal_after_external_restore()
+    pub fn reload_wal_after_external_restore(
+        &self,
+        permit: &crate::ExternalRestorePermit,
+    ) -> Result<()> {
+        self.db.reload_wal_after_external_restore(permit)
     }
 
     /// Enable or disable writing portable logical-change metadata into MVCC
@@ -3053,6 +3026,15 @@ impl Connection {
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     /// `VACUUM INTO` uses it for the output database even in WAL mode.
     pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        if self
+            .get_pager_from_database_index(&database_id)?
+            .encryption_cipher()
+            != CipherMode::None
+        {
+            return Err(LimboError::InvalidArgument(
+                "encrypted database page size is fixed when opening the database".into(),
+            ));
+        }
         self.next_page_size.store(size, Ordering::SeqCst);
         if self.get_source_database(database_id).initialized() {
             return Ok(());
@@ -3070,7 +3052,7 @@ impl Connection {
         // sized to the connection's page_size but compute usable_space from the stale 4 KiB
         // global header, tripping the btree_init_page assertion.
         if let Some(mv_store) = self.mv_store_for_db(database_id).as_ref() {
-            mv_store.set_global_page_size(size);
+            mv_store.set_global_page_size(pager.get_page_size_unchecked());
         }
         self.bump_prepare_context_generation();
 
@@ -3260,14 +3242,14 @@ impl Connection {
         T: crate::vtab::InternalVirtualTable + 'static,
     {
         let name = self.db.register_internal_vtab(table)?;
-        *self.schema.write() = self.db.clone_schema();
+        *self.schema.write() = self.db.schema_for_pager(&self.pager.load());
         self.bump_prepare_context_generation();
         Ok(name)
     }
 
     pub fn register_virtual_table(&self, table: Arc<crate::VirtualTable>) -> Result<String> {
         let name = self.db.register_virtual_table(table)?;
-        *self.schema.write() = self.db.clone_schema();
+        *self.schema.write() = self.db.schema_for_pager(&self.pager.load());
         self.bump_prepare_context_generation();
         Ok(name)
     }
@@ -3599,8 +3581,7 @@ impl Connection {
             .index_to_data
             .get(&database_id)
             .expect("Database ID should be valid after resolve_namespace");
-        let schema = entry.db.schema.lock().clone();
-        schema
+        entry.db.schema_for_pager(&entry.pager)
     }
 
     /// Publish a connection-local non-main schema after commit.
@@ -3806,14 +3787,14 @@ impl Connection {
     /// Panics if `database_id` is neither main nor an attached database.
     pub(crate) fn clone_shared_schema(&self, database_id: usize) -> Arc<Schema> {
         if database_id == crate::MAIN_DB_ID {
-            self.db.clone_schema()
+            self.db.schema_for_pager(&self.pager.load())
         } else {
             let attached_databases = self.attached_databases.read();
             let entry = attached_databases
                 .index_to_data
                 .get(&database_id)
                 .expect("shared schema requested for unknown attached database");
-            entry.db.clone_schema()
+            entry.db.schema_for_pager(&entry.pager)
         }
     }
 
@@ -4708,24 +4689,28 @@ impl Connection {
         Arc::as_ptr(&self.db) as usize
     }
 
-    pub fn set_encryption_key(&self, key: EncryptionKey) -> Result<()> {
-        tracing::trace!("setting encryption key for connection");
-        self.ensure_can_change_encryption_settings()?;
-        *self.encryption_key.write() = Some(key);
-        self.bump_prepare_context_generation();
-        self.set_encryption_context()
+    pub fn set_encryption_key(&self, _key: EncryptionKey) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "encryption must be configured when opening the database".into(),
+        ))
     }
 
-    pub fn set_encryption_cipher(&self, cipher_mode: CipherMode) -> Result<()> {
-        tracing::trace!("setting encryption cipher for connection");
-        self.ensure_can_change_encryption_settings()?;
-        self.encryption_cipher_mode.set(cipher_mode);
-        self.bump_prepare_context_generation();
-        self.set_encryption_context()
+    pub fn set_encryption_cipher(&self, _cipher_mode: CipherMode) -> Result<()> {
+        Err(LimboError::InvalidArgument(
+            "encryption must be configured when opening the database".into(),
+        ))
     }
 
     pub fn set_reserved_bytes(&self, reserved_bytes: u8) -> Result<()> {
         let pager = self.pager.load();
+        if pager.encryption_cipher() != CipherMode::None {
+            if reserved_bytes as usize == pager.encryption_cipher().metadata_size() {
+                return Ok(());
+            }
+            return Err(LimboError::InvalidArgument(
+                "encrypted database reserved bytes are fixed when opening the database".into(),
+            ));
+        }
         if let Some(codec) = pager.page_codec_external() {
             let required_reserved_bytes = codec.required_reserved_bytes();
             if reserved_bytes != required_reserved_bytes {
@@ -4749,47 +4734,10 @@ impl Connection {
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
-        match self.encryption_cipher_mode.get() {
+        match self.pager.load().encryption_cipher() {
             CipherMode::None => None,
             mode => Some(mode),
         }
-    }
-
-    fn ensure_can_change_encryption_settings(&self) -> Result<()> {
-        let pager = self.pager.load();
-        if pager.is_encryption_ctx_set() {
-            return Err(LimboError::InvalidArgument(
-                "cannot reset encryption attributes if already set in the session".to_string(),
-            ));
-        }
-        if pager.has_external_page_codec() {
-            return Err(LimboError::InvalidArgument(
-                "cannot configure built-in encryption while an external page codec is installed"
-                    .to_string(),
-            ));
-        }
-        if self.db.get_mv_store().is_some() {
-            return Err(LimboError::InvalidArgument(
-                "cannot enable encryption after MVCC is active; configure encryption before PRAGMA journal_mode='mvcc'"
-                    .to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    // if both key and cipher are set, set encryption context on pager
-    fn set_encryption_context(&self) -> Result<()> {
-        let key_guard = self.encryption_key.read();
-        let Some(key) = key_guard.as_ref() else {
-            return Ok(());
-        };
-        let cipher_mode = self.get_encryption_cipher_mode();
-        let Some(cipher_mode) = cipher_mode else {
-            return Ok(());
-        };
-        tracing::trace!("setting encryption ctx for connection");
-        let pager = self.pager.load();
-        pager.set_encryption_context(cipher_mode, key)
     }
 
     /// Sets a custom busy handler callback.
@@ -5524,7 +5472,6 @@ impl SymbolTable {
 mod tests {
     use super::*;
     use crate::attach::AttachDatabaseState;
-    use crate::security::roles::SessionRole;
     use crate::ConnectOpts;
     use crate::EngineDialect;
     use crate::IOResult;
@@ -5541,7 +5488,7 @@ mod tests {
             Arc::new(EngineDialect),
         )
         .unwrap();
-        db.connect(ConnectOpts::new(SessionRole::Superuser))
+        db.connect(ConnectOpts::new(crate::SessionRole::Superuser))
             .unwrap()
     }
 
@@ -5684,7 +5631,7 @@ mod tests {
         )
         .unwrap();
         let conn = db
-            .connect(ConnectOpts::new(SessionRole::Superuser))
+            .connect(ConnectOpts::new(crate::SessionRole::Superuser))
             .unwrap();
         conn.with_schema_mut(|schema| {
             schema.dialect_schema = Some(Arc::new(()));

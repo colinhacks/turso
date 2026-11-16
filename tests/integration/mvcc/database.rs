@@ -10691,8 +10691,11 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
-        fn reset_to_fresh_header(&self) -> Result<Completion> {
-            self.inner.reset_to_fresh_header()
+        fn reset_to_fresh_header(
+            &self,
+            reservation: &turso_core::ExternalRestoreGuard,
+        ) -> Result<Completion> {
+            self.inner.reset_to_fresh_header(reservation)
         }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()
@@ -10924,8 +10927,11 @@ fn logical_log_offset_advances_only_after_on_log_write_complete() {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
-        fn reset_to_fresh_header(&self) -> Result<Completion> {
-            self.inner.reset_to_fresh_header()
+        fn reset_to_fresh_header(
+            &self,
+            reservation: &turso_core::ExternalRestoreGuard,
+        ) -> Result<Completion> {
+            self.inner.reset_to_fresh_header(reservation)
         }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()

@@ -7225,8 +7225,12 @@ fn on_checkpoint_end_runs_before_blocking_checkpoint_unlock() {
         )> {
             self.inner.truncate(checkpointed_through_ts)
         }
-        fn reset_to_fresh_header(&self) -> Result<Completion> {
-            self.inner.reset_to_fresh_header()
+        #[cfg(feature = "conn_raw_api")]
+        fn reset_to_fresh_header(
+            &self,
+            reservation: &crate::ExternalRestoreGuard,
+        ) -> Result<Completion> {
+            self.inner.reset_to_fresh_header(reservation)
         }
         fn get_logical_log_file(&self) -> Arc<dyn File> {
             self.inner.get_logical_log_file()
