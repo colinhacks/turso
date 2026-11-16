@@ -1781,9 +1781,10 @@ pub async fn decode_raw_mvcc_logical_log_to_file<Ctx>(
 }
 
 /// Bootstrap multiple DB files from latest generation from remote
-pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
+pub(crate) async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     db: Arc<dyn turso_core::File>,
+    reservation: &turso_core::ExternalRestoreGuard,
 ) -> Result<DbSyncInfo> {
     tracing::info!("db_bootstrap");
     let db_info = db_info_http(ctx).await?;
@@ -1808,6 +1809,7 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
                 };
                 assert!(size as usize == content_len);
             });
+            reservation.protect_completion(&c);
             let c = db.pwrite(pos, buffer.clone(), c)?;
             while !c.succeeded() {
                 ctx.coro.yield_(SyncEngineIoResult::IO).await?;
@@ -3371,6 +3373,8 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     pull_bytes_threshold: Option<usize>,
     pull_parallel_requests: Option<usize>,
 ) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
+    let _restore_reservation =
+        turso_core::Database::preflight_external_restore_for_path(io.clone(), main_db_path)?;
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
             if partial_sync.is_some() {
@@ -3445,6 +3449,7 @@ async fn write_bootstrap_page<Ctx>(
     buffer: &Arc<Buffer>,
     header: &PullUpdatesRespProtoBody,
     page_data: PageData,
+    reservation: &turso_core::ExternalRestoreGuard,
 ) -> Result<()> {
     tracing::debug!(
         "bootstrap_db_file: received page page_id={}",
@@ -3467,6 +3472,7 @@ async fn write_bootstrap_page<Ctx>(
         };
         assert!(size as usize == PAGE_SIZE);
     });
+    reservation.protect_completion(&c);
     let c = file.pwrite(offset, buffer.clone(), c)?;
     while !c.succeeded() {
         coro.yield_(SyncEngineIoResult::IO).await?;
@@ -3498,6 +3504,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
     file: &Arc<dyn turso_core::File>,
     server_pages_selector: Vec<u8>,
     server_query_selector: String,
+    reservation: &turso_core::ExternalRestoreGuard,
 ) -> Result<PullUpdatesRespProtoBody> {
     let completion =
         send_pull_chunk_request(ctx, "", server_pages_selector, server_query_selector)?;
@@ -3516,6 +3523,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
         };
         assert!(rc as usize == 0);
     });
+    reservation.protect_completion(&c);
     let c = file.truncate(header.db_size * PAGE_SIZE as u64, c)?;
     while !c.succeeded() {
         ctx.coro.yield_(SyncEngineIoResult::IO).await?;
@@ -3530,7 +3538,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
     )
     .await?
     {
-        write_bootstrap_page(ctx.coro, file, &buffer, &header, page_data).await?;
+        write_bootstrap_page(ctx.coro, file, &buffer, &header, page_data, reservation).await?;
     }
     Ok(header)
 }
@@ -3538,6 +3546,7 @@ async fn pull_chunk_into_file<IO: SyncEngineIo, Ctx>(
 /// Stream pages `[start, last_page_id)` into `file` in chunks of `chunk_pages`
 /// pages, with up to `parallel_requests` chunk requests in flight. Every
 /// request is pinned to `server_revision`.
+#[allow(clippy::too_many_arguments)]
 async fn pull_chunks_into_file<IO: SyncEngineIo, Ctx>(
     ctx: &SyncOperationCtx<'_, IO, Ctx>,
     file: &Arc<dyn turso_core::File>,
@@ -3546,6 +3555,7 @@ async fn pull_chunks_into_file<IO: SyncEngineIo, Ctx>(
     mut start: u64,
     last_page_id: u64,
     parallel_requests: usize,
+    reservation: &turso_core::ExternalRestoreGuard,
 ) -> Result<()> {
     #[allow(clippy::arc_with_non_send_sync)]
     let buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
@@ -3595,7 +3605,15 @@ async fn pull_chunks_into_file<IO: SyncEngineIo, Ctx>(
             let finished = loop {
                 match poll_proto_message::<PageData>(completion, &ctx.io.network_stats, bytes)? {
                     ProtoPoll::Message(page_data) => {
-                        write_bootstrap_page(ctx.coro, file, &buffer, header, page_data).await?;
+                        write_bootstrap_page(
+                            ctx.coro,
+                            file,
+                            &buffer,
+                            header,
+                            page_data,
+                            reservation,
+                        )
+                        .await?;
                         progress = true;
                     }
                     ProtoPoll::Pending => break false,
@@ -3623,6 +3641,8 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     pull_bytes_threshold: Option<usize>,
     pull_parallel_requests: Option<usize>,
 ) -> Result<(DatabasePullRevision, RemotePullProtocol)> {
+    let _restore_reservation =
+        turso_core::Database::preflight_external_restore_for_path(io.clone(), main_db_path)?;
     if let Some(PartialSyncOpts {
         bootstrap_strategy: None,
         ..
@@ -3678,7 +3698,14 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     } else {
         Vec::new()
     };
-    let header = pull_chunk_into_file(ctx, &file, first_selector, server_query_selector).await?;
+    let header = pull_chunk_into_file(
+        ctx,
+        &file,
+        first_selector,
+        server_query_selector,
+        &_restore_reservation,
+    )
+    .await?;
 
     // Subsequent chunks (if any). Pin every chunk to the same `server_revision`
     // so the page set stays consistent across HTTP round-trips, and never go
@@ -3696,6 +3723,7 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
             n as u64,
             last_page_id,
             pull_parallel_requests.unwrap_or(1).max(1),
+            &_restore_reservation,
         )
         .await?;
     }
@@ -3739,23 +3767,25 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
 ) -> Result<DatabasePullRevision> {
+    let _restore_reservation =
+        turso_core::Database::preflight_external_restore_for_path(io.clone(), main_db_path)?;
     tracing::info!("bootstrap_db_file(path={})", main_db_path);
 
     let start_time = io.current_time_monotonic();
     // cleanup all files left from previous attempt to bootstrap
     // we shouldn't write any WAL files - but let's truncate them too for safety
     if let Some(file) = io.try_open(main_db_path)? {
-        io.truncate(ctx.coro, file, 0).await?;
+        truncate_for_external_restore(ctx.coro, &file, &_restore_reservation).await?;
     }
     if let Some(file) = io.try_open(&format!("{main_db_path}-wal"))? {
-        io.truncate(ctx.coro, file.clone(), 0).await?;
+        truncate_for_external_restore(ctx.coro, &file, &_restore_reservation).await?;
         // Make the WAL reset durable so a stale WAL can't reappear next to the
         // freshly bootstrapped DB after a crash and get replayed onto it.
         sync_file(ctx.coro, &file).await?;
     }
 
     let file = io.create(main_db_path)?;
-    let db_info = db_bootstrap(ctx, file).await?;
+    let db_info = db_bootstrap(ctx, file, &_restore_reservation).await?;
 
     let elapsed = io.current_time_monotonic().duration_since(start_time);
     tracing::info!(
@@ -3770,6 +3800,23 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
     })
 }
 
+async fn truncate_for_external_restore<Ctx>(
+    coro: &Coro<Ctx>,
+    file: &Arc<dyn turso_core::File>,
+    reservation: &turso_core::ExternalRestoreGuard,
+) -> Result<()> {
+    let c = Completion::new_trunc(|_| {});
+    reservation.protect_completion(&c);
+    let c = file.truncate(0, c)?;
+    while !c.finished() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    if let Some(error) = c.get_error() {
+        return Err(turso_core::LimboError::CompletionError(error).into());
+    }
+    Ok(())
+}
+
 /// fsync the given file, yielding on the coro until the sync completion finishes.
 pub async fn sync_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) -> Result<()> {
     let c = Completion::new_sync(|_| {
@@ -3782,7 +3829,7 @@ pub async fn sync_file<Ctx>(coro: &Coro<Ctx>, file: &Arc<dyn turso_core::File>) 
     Ok(())
 }
 
-pub async fn reset_wal_file<Ctx>(
+pub(crate) async fn reset_wal_file<Ctx>(
     coro: &Coro<Ctx>,
     wal: Arc<dyn turso_core::File>,
     frames_count: u64,
